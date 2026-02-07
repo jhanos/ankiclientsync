@@ -54,12 +54,19 @@ uv run --env-file .env python -m anki.syncserver
 ### Run tests
 
 ```bash
-# Create virtual environment and install dependencies
-uv venv .venv
-uv pip install requests zstandard
+# Run upload tests (upload local collection to server)
+uv run --env-file tests/.env python -m ankiclientsync.tests.test_upload
 
-# Run tests (from parent directory)
-PYTHONPATH=/path/to/git .venv/bin/python -m ankiclientsync.tests.test_sync_client
+# Run download tests (download, modify, and re-upload)
+uv run --env-file tests/.env python -m ankiclientsync.tests.test_download
+```
+
+You can customize the test configuration by editing `tests/.env`:
+
+```bash
+ANKI_ENDPOINT=http://localhost:8080/
+ANKI_USERNAME=user
+ANKI_PASSWORD=pass
 ```
 
 ## License

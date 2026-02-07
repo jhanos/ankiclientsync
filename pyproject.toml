@@ -1,10 +1,21 @@
 [project]
 name = "ankiclientsync"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "Python implementation of the Anki sync protocol"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "requests>=2.32.5",
     "zstandard>=0.25.0",
 ]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ankiclientsync", "ankiclientsync.tests"]
+
+[tool.setuptools.package-dir]
+ankiclientsync = "."
+"ankiclientsync.tests" = "tests"
