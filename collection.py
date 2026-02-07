@@ -941,3 +941,637 @@ class SyncableCollection(CollectionSyncInterface):
         self.db.commit()
 
         return note_id
+
+    # -------------------------------------------------------------------------
+    # Export Functions
+    # -------------------------------------------------------------------------
+
+    def export_anki_package(
+        self,
+        out_path: str | Path,
+        deck_id: Optional[int] = None,
+        with_scheduling: bool = True,
+        with_media: bool = False,
+        legacy: bool = False,
+    ) -> int:
+        """
+        Export collection or deck to an .apkg file.
+
+        Args:
+            out_path: Path to output .apkg file
+            deck_id: If provided, only export this deck. Otherwise export all.
+            with_scheduling: Include review history and scheduling info
+            with_media: Include media files (not yet implemented)
+            legacy: Use legacy format for older Anki clients
+
+        Returns:
+            Number of notes exported
+        """
+        import zipfile
+        import io
+
+        out_path = Path(out_path)
+
+        # Gather data to export
+        data = self._gather_export_data(deck_id, with_scheduling)
+
+        # Create a temporary collection with only the exported data
+        temp_col_bytes = self._create_export_collection(data, with_scheduling, legacy)
+
+        # Build the .apkg ZIP archive
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as zf:
+            # Write meta file (protobuf encoded)
+            meta_bytes = self._encode_package_meta(legacy)
+            zf.writestr("meta", meta_bytes)
+
+            # Write collection file
+            col_filename = "collection.anki21" if legacy else "collection.anki21b"
+            if legacy:
+                zf.writestr(col_filename, temp_col_bytes)
+            else:
+                # Compress with zstd for latest format
+                import zstandard as zstd
+
+                compressor = zstd.ZstdCompressor()
+                compressed = compressor.compress(temp_col_bytes)
+                zf.writestr(col_filename, compressed)
+
+            # Write legacy dummy collection for older clients
+            if not legacy:
+                dummy_col = self._create_dummy_collection()
+                zf.writestr("collection.anki2", dummy_col)
+
+            # Write media map (empty for now)
+            if legacy:
+                zf.writestr("media", b"{}")
+            else:
+                # Empty MediaEntries protobuf
+                zf.writestr("media", b"")
+
+        return len(data["notes"])
+
+    def _gather_export_data(
+        self, deck_id: Optional[int], with_scheduling: bool
+    ) -> dict:
+        """Gather all data needed for export."""
+        data = {
+            "notes": [],
+            "cards": [],
+            "decks": [],
+            "notetypes": [],
+            "revlog": [],
+            "deck_configs": [],
+        }
+
+        # Get deck IDs to export
+        if deck_id:
+            # Get the deck and its children
+            deck_ids = self._get_deck_and_children_ids(deck_id)
+        else:
+            # All decks
+            deck_ids = [row["id"] for row in self.db.execute("SELECT id FROM decks")]
+
+        # Get cards in those decks
+        if deck_ids:
+            placeholders = ",".join("?" * len(deck_ids))
+            card_rows = self.db.execute(
+                f"SELECT * FROM cards WHERE did IN ({placeholders})", deck_ids
+            ).fetchall()
+        else:
+            card_rows = []
+
+        for row in card_rows:
+            data["cards"].append(dict(row))
+
+        # Get notes for those cards
+        note_ids = list(set(card["nid"] for card in data["cards"]))
+        if note_ids:
+            placeholders = ",".join("?" * len(note_ids))
+            note_rows = self.db.execute(
+                f"SELECT * FROM notes WHERE id IN ({placeholders})", note_ids
+            ).fetchall()
+            for row in note_rows:
+                data["notes"].append(dict(row))
+
+        # Get notetypes used by those notes
+        notetype_ids = list(set(note["mid"] for note in data["notes"]))
+        if notetype_ids:
+            placeholders = ",".join("?" * len(notetype_ids))
+            for row in self.db.execute(
+                f"SELECT * FROM notetypes WHERE id IN ({placeholders})", notetype_ids
+            ):
+                nt_dict = self._get_notetype_dict(row["id"])
+                if nt_dict:
+                    data["notetypes"].append(nt_dict)
+
+        # Get decks
+        for did in deck_ids:
+            deck_dict = self._get_deck_dict(did)
+            if deck_dict:
+                data["decks"].append(deck_dict)
+
+        # Get deck configs
+        config_ids = list(set(d.get("conf", 1) for d in data["decks"]))
+        if config_ids:
+            placeholders = ",".join("?" * len(config_ids))
+            for row in self.db.execute(
+                f"SELECT * FROM deck_config WHERE id IN ({placeholders})", config_ids
+            ):
+                dconf_dict = self._get_deck_config_dict(row["id"])
+                if dconf_dict:
+                    data["deck_configs"].append(dconf_dict)
+
+        # Get revlog if scheduling is included
+        if with_scheduling:
+            card_ids = [c["id"] for c in data["cards"]]
+            if card_ids:
+                placeholders = ",".join("?" * len(card_ids))
+                for row in self.db.execute(
+                    f"SELECT * FROM revlog WHERE cid IN ({placeholders})", card_ids
+                ):
+                    data["revlog"].append(dict(row))
+
+        return data
+
+    def _get_deck_and_children_ids(self, deck_id: int) -> list[int]:
+        """Get a deck and all its children's IDs."""
+        # Get the deck name
+        row = self.db.execute(
+            "SELECT name FROM decks WHERE id = ?", (deck_id,)
+        ).fetchone()
+        if not row:
+            return []
+
+        deck_name = row["name"]
+        deck_ids = [deck_id]
+
+        # Find all child decks (name starts with "parent::")
+        prefix = deck_name + "::"
+        for row in self.db.execute("SELECT id, name FROM decks"):
+            if row["name"].startswith(prefix):
+                deck_ids.append(row["id"])
+
+        return deck_ids
+
+    def _create_export_collection(
+        self, data: dict, with_scheduling: bool, legacy: bool
+    ) -> bytes:
+        """Create a minimal collection database with only the exported data."""
+        import tempfile
+
+        # Create temp file for the collection
+        with tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as f:
+            temp_path = Path(f.name)
+
+        try:
+            # Create the schema
+            self._create_collection_schema(temp_path, legacy)
+
+            # Connect and insert data
+            temp_db = _connect_db(temp_path)
+            try:
+                self._insert_export_data(temp_db, data, with_scheduling, legacy)
+                temp_db.commit()
+            finally:
+                temp_db.close()
+
+            # Read the file contents
+            return temp_path.read_bytes()
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def _create_collection_schema(self, path: Path, legacy: bool) -> None:
+        """Create the Anki collection database schema."""
+        import sqlite3
+
+        db = sqlite3.connect(str(path))
+        db.create_collation("unicase", _unicase)
+        db.executescript("""
+            -- Collection metadata
+            CREATE TABLE col (
+                id INTEGER PRIMARY KEY,
+                crt INTEGER NOT NULL,
+                mod INTEGER NOT NULL,
+                scm INTEGER NOT NULL,
+                ver INTEGER NOT NULL,
+                dty INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                ls INTEGER NOT NULL,
+                conf TEXT NOT NULL,
+                models TEXT NOT NULL,
+                decks TEXT NOT NULL,
+                dconf TEXT NOT NULL,
+                tags TEXT NOT NULL
+            );
+
+            -- Notes
+            CREATE TABLE notes (
+                id INTEGER PRIMARY KEY,
+                guid TEXT NOT NULL,
+                mid INTEGER NOT NULL,
+                mod INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                tags TEXT NOT NULL,
+                flds TEXT NOT NULL,
+                sfld TEXT NOT NULL,
+                csum INTEGER NOT NULL,
+                flags INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+
+            -- Cards
+            CREATE TABLE cards (
+                id INTEGER PRIMARY KEY,
+                nid INTEGER NOT NULL,
+                did INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                mod INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                type INTEGER NOT NULL,
+                queue INTEGER NOT NULL,
+                due INTEGER NOT NULL,
+                ivl INTEGER NOT NULL,
+                factor INTEGER NOT NULL,
+                reps INTEGER NOT NULL,
+                lapses INTEGER NOT NULL,
+                left INTEGER NOT NULL,
+                odue INTEGER NOT NULL,
+                odid INTEGER NOT NULL,
+                flags INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+
+            -- Review log
+            CREATE TABLE revlog (
+                id INTEGER PRIMARY KEY,
+                cid INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                ease INTEGER NOT NULL,
+                ivl INTEGER NOT NULL,
+                lastIvl INTEGER NOT NULL,
+                factor INTEGER NOT NULL,
+                time INTEGER NOT NULL,
+                type INTEGER NOT NULL
+            );
+
+            -- Graves
+            CREATE TABLE graves (
+                usn INTEGER NOT NULL,
+                oid INTEGER NOT NULL,
+                type INTEGER NOT NULL
+            );
+
+            -- Notetypes (modern schema)
+            CREATE TABLE notetypes (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL COLLATE unicase,
+                mtime_secs INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                config BLOB NOT NULL
+            );
+
+            -- Fields
+            CREATE TABLE fields (
+                ntid INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                name TEXT NOT NULL COLLATE unicase,
+                config BLOB NOT NULL,
+                PRIMARY KEY (ntid, ord)
+            );
+
+            -- Templates
+            CREATE TABLE templates (
+                ntid INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                name TEXT NOT NULL COLLATE unicase,
+                mtime_secs INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                config BLOB NOT NULL,
+                PRIMARY KEY (ntid, ord)
+            );
+
+            -- Decks (modern schema)
+            CREATE TABLE decks (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL COLLATE unicase,
+                mtime_secs INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                common BLOB NOT NULL,
+                kind BLOB NOT NULL
+            );
+
+            -- Deck config
+            CREATE TABLE deck_config (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL COLLATE unicase,
+                mtime_secs INTEGER NOT NULL,
+                usn INTEGER NOT NULL,
+                config BLOB NOT NULL
+            );
+
+            -- Tags
+            CREATE TABLE tags (
+                tag TEXT PRIMARY KEY NOT NULL COLLATE unicase,
+                usn INTEGER NOT NULL
+            );
+
+            -- Indexes
+            CREATE INDEX ix_notes_mid ON notes (mid);
+            CREATE INDEX ix_notes_usn ON notes (usn);
+            CREATE INDEX ix_notes_csum ON notes (csum);
+            CREATE INDEX ix_cards_nid ON cards (nid);
+            CREATE INDEX ix_cards_did ON cards (did);
+            CREATE INDEX ix_cards_usn ON cards (usn);
+            CREATE INDEX ix_cards_sched ON cards (did, queue, due);
+            CREATE INDEX ix_revlog_cid ON revlog (cid);
+            CREATE INDEX ix_revlog_usn ON revlog (usn);
+        """)
+
+        # Get creation time from source collection
+        crt = self.db.execute("SELECT crt FROM col WHERE id = 1").fetchone()
+        crt = crt[0] if crt else int(time.time())
+
+        # Insert col row
+        mod = int(time.time() * 1000)
+        scm = mod
+        ver = 11 if legacy else 18
+        db.execute(
+            """INSERT INTO col (id, crt, mod, scm, ver, dty, usn, ls, conf, models, decks, dconf, tags)
+               VALUES (1, ?, ?, ?, ?, 0, 0, 0, '{}', '{}', '{}', '{}', '{}')""",
+            (crt, mod, scm, ver),
+        )
+        db.commit()
+        db.close()
+
+    def _insert_export_data(
+        self, db: sqlite3.Connection, data: dict, with_scheduling: bool, legacy: bool
+    ) -> None:
+        """Insert gathered data into the export collection."""
+        # Insert notes
+        for note in data["notes"]:
+            if with_scheduling:
+                db.execute(
+                    """INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data)
+                       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        note["id"],
+                        note["guid"],
+                        note["mid"],
+                        note["mod"],
+                        note["tags"],
+                        note["flds"],
+                        note["sfld"],
+                        note["csum"],
+                        note["flags"],
+                        note["data"],
+                    ),
+                )
+            else:
+                # Reset USN and strip system tags
+                tags = note["tags"]
+                # Remove system tags (marked, leech)
+                tag_list = [
+                    t for t in tags.split() if t.lower() not in ("marked", "leech")
+                ]
+                db.execute(
+                    """INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data)
+                       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 0, '')""",
+                    (
+                        note["id"],
+                        note["guid"],
+                        note["mid"],
+                        note["mod"],
+                        " ".join(tag_list),
+                        note["flds"],
+                        note["sfld"],
+                        note["csum"],
+                    ),
+                )
+
+        # Insert cards
+        for card in data["cards"]:
+            if with_scheduling:
+                db.execute(
+                    """INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl,
+                                          factor, reps, lapses, left, odue, odid, flags, data)
+                       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        card["id"],
+                        card["nid"],
+                        card["did"],
+                        card["ord"],
+                        card["mod"],
+                        card["type"],
+                        card["queue"],
+                        card["due"],
+                        card["ivl"],
+                        card["factor"],
+                        card["reps"],
+                        card["lapses"],
+                        card["left"],
+                        card["odue"],
+                        card["odid"],
+                        card["flags"],
+                        card["data"],
+                    ),
+                )
+            else:
+                # Reset card to new state
+                db.execute(
+                    """INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl,
+                                          factor, reps, lapses, left, odue, odid, flags, data)
+                       VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')""",
+                    (
+                        card["id"],
+                        card["nid"],
+                        card["did"],
+                        card["ord"],
+                        card["mod"],
+                    ),
+                )
+
+        # Insert revlog if scheduling
+        if with_scheduling:
+            for rev in data["revlog"]:
+                db.execute(
+                    """INSERT INTO revlog (id, cid, usn, ease, ivl, lastIvl, factor, time, type)
+                       VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        rev["id"],
+                        rev["cid"],
+                        rev["ease"],
+                        rev["ivl"],
+                        rev["lastIvl"],
+                        rev["factor"],
+                        rev["time"],
+                        rev["type"],
+                    ),
+                )
+
+        # Insert notetypes
+        for nt in data["notetypes"]:
+            # Build config protobuf
+            nt_config = b""
+            if css := nt.get("css", ""):
+                nt_config += _encode_string(3, css)
+
+            db.execute(
+                """INSERT INTO notetypes (id, name, mtime_secs, usn, config)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (nt["id"], nt["name"], nt.get("mod", 0), nt_config),
+            )
+
+            # Insert fields
+            for fld in nt.get("flds", []):
+                fld_config = b""
+                if font := fld.get("font", "Arial"):
+                    fld_config += _encode_string(3, font)
+                if size := fld.get("size", 20):
+                    fld_config += _encode_varint_field(4, size)
+
+                db.execute(
+                    "INSERT INTO fields (ntid, ord, name, config) VALUES (?, ?, ?, ?)",
+                    (nt["id"], fld.get("ord", 0), fld["name"], fld_config),
+                )
+
+            # Insert templates
+            for tmpl in nt.get("tmpls", []):
+                tmpl_config = b""
+                if qfmt := tmpl.get("qfmt", ""):
+                    tmpl_config += _encode_string(1, qfmt)
+                if afmt := tmpl.get("afmt", ""):
+                    tmpl_config += _encode_string(2, afmt)
+
+                db.execute(
+                    """INSERT INTO templates (ntid, ord, name, mtime_secs, usn, config)
+                       VALUES (?, ?, ?, 0, 0, ?)""",
+                    (nt["id"], tmpl.get("ord", 0), tmpl["name"], tmpl_config),
+                )
+
+        # Insert decks
+        for deck in data["decks"]:
+            # Build common protobuf
+            common = _encode_varint_field(1, 0) + _encode_varint_field(2, 0)
+
+            # Build kind protobuf
+            is_filtered = deck.get("dyn", 0) == 1
+            if is_filtered:
+                kind = _encode_bytes(2, b"")
+            else:
+                conf_id = deck.get("conf", 1)
+                normal_deck = _encode_varint_field(1, conf_id)
+                kind = _encode_bytes(1, normal_deck)
+
+            db.execute(
+                """INSERT INTO decks (id, name, mtime_secs, usn, common, kind)
+                   VALUES (?, ?, ?, 0, ?, ?)""",
+                (deck["id"], deck["name"], deck.get("mod", 0), common, kind),
+            )
+
+        # Insert deck configs
+        for dconf in data["deck_configs"]:
+            # Empty config protobuf - Anki will use defaults
+            db.execute(
+                """INSERT INTO deck_config (id, name, mtime_secs, usn, config)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (dconf["id"], dconf["name"], dconf.get("mod", 0), b""),
+            )
+
+    def _encode_package_meta(self, legacy: bool) -> bytes:
+        """Encode package metadata as protobuf."""
+        # PackageMetadata message: field 1 = version (varint)
+        # Version: Legacy1=1, Legacy2=2, Latest=3
+        version = 2 if legacy else 3
+        return _encode_varint_field(1, version)
+
+    def _create_dummy_collection(self) -> bytes:
+        """Create a dummy collection for older Anki clients."""
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as f:
+            temp_path = Path(f.name)
+
+        try:
+            import sqlite3
+
+            db = sqlite3.connect(str(temp_path))
+            db.executescript("""
+                CREATE TABLE col (
+                    id INTEGER PRIMARY KEY, crt INTEGER, mod INTEGER, scm INTEGER,
+                    ver INTEGER, dty INTEGER, usn INTEGER, ls INTEGER,
+                    conf TEXT, models TEXT, decks TEXT, dconf TEXT, tags TEXT
+                );
+                CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY, guid TEXT, mid INTEGER, mod INTEGER,
+                    usn INTEGER, tags TEXT, flds TEXT, sfld TEXT, csum INTEGER,
+                    flags INTEGER, data TEXT
+                );
+                CREATE TABLE cards (
+                    id INTEGER PRIMARY KEY, nid INTEGER, did INTEGER, ord INTEGER,
+                    mod INTEGER, usn INTEGER, type INTEGER, queue INTEGER,
+                    due INTEGER, ivl INTEGER, factor INTEGER, reps INTEGER,
+                    lapses INTEGER, left INTEGER, odue INTEGER, odid INTEGER,
+                    flags INTEGER, data TEXT
+                );
+                CREATE TABLE revlog (
+                    id INTEGER PRIMARY KEY, cid INTEGER, usn INTEGER, ease INTEGER,
+                    ivl INTEGER, lastIvl INTEGER, factor INTEGER, time INTEGER,
+                    type INTEGER
+                );
+                CREATE TABLE graves (usn INTEGER, oid INTEGER, type INTEGER);
+            """)
+
+            crt = int(time.time())
+            mod = crt * 1000
+
+            # Minimal notetype for the dummy note
+            basic_model = {
+                "1": {
+                    "id": 1,
+                    "name": "Basic",
+                    "type": 0,
+                    "mod": 0,
+                    "usn": 0,
+                    "flds": [
+                        {"name": "Front", "ord": 0, "font": "Arial", "size": 20},
+                        {"name": "Back", "ord": 1, "font": "Arial", "size": 20},
+                    ],
+                    "tmpls": [
+                        {
+                            "name": "Card 1",
+                            "ord": 0,
+                            "qfmt": "{{Front}}",
+                            "afmt": "{{FrontSide}}<hr id=answer>{{Back}}",
+                        }
+                    ],
+                    "css": ".card { font-family: arial; }",
+                }
+            }
+
+            default_deck = {"1": {"id": 1, "name": "Default", "mod": 0, "usn": 0}}
+
+            db.execute(
+                """INSERT INTO col VALUES (1, ?, ?, ?, 11, 0, 0, 0, '{}', ?, ?, '{}', '{}')""",
+                (crt, mod, mod, json.dumps(basic_model), json.dumps(default_deck)),
+            )
+
+            # Add dummy note explaining the package is too new
+            db.execute(
+                """INSERT INTO notes VALUES (1, 'dummy', 1, ?, 0, '',
+                   'This Anki package was created with a newer version of Anki.\x1fPlease update Anki to import this package.',
+                   'This Anki package was created with a newer version of Anki.', 0, 0, '')""",
+                (crt,),
+            )
+            db.execute(
+                """INSERT INTO cards VALUES (1, 1, 1, 0, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')""",
+                (crt,),
+            )
+
+            db.execute("PRAGMA page_size=512")
+            db.commit()
+            db.execute("VACUUM")
+            db.close()
+
+            return temp_path.read_bytes()
+        finally:
+            temp_path.unlink(missing_ok=True)
