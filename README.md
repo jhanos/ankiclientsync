@@ -5,7 +5,7 @@ A Python implementation of the Anki sync protocol. Supports both AnkiWeb and cus
 ## Installation
 
 ```bash
-pip install ""git+https://github.com/jhanos/ankiclientsync.git"
+pip install "git+https://github.com/jhanos/ankiclientsync.git"
 ```
 
 ## Usage
