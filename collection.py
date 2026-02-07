@@ -158,9 +158,18 @@ class SyncableCollection(CollectionSyncInterface):
         col = SyncableCollection("/path/to/collection.anki2")
         client = SyncClient(col, auth)
         result = client.sync()  # Performs partial sync if possible
+
+    Media Sync:
+        col = SyncableCollection("/path/to/collection.anki2", media_folder="/path/to/collection.media")
+        # Media folder is typically next to collection.anki2
     """
 
-    def __init__(self, col_path: str | Path, work_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        col_path: str | Path,
+        work_dir: Optional[Path] = None,
+        media_folder: Optional[str | Path] = None,
+    ):
         """
         Initialize the syncable collection.
 
@@ -168,6 +177,8 @@ class SyncableCollection(CollectionSyncInterface):
             col_path: Path to the collection.anki2 file
             work_dir: Optional working directory. If provided, the collection
                       is copied there for sync operations.
+            media_folder: Optional path to media folder. If not provided,
+                          defaults to collection.media next to collection file.
         """
         self.original_path = Path(col_path)
 
@@ -179,6 +190,12 @@ class SyncableCollection(CollectionSyncInterface):
 
         self.db = _connect_db(self.db_path)
         self._in_transaction = False
+
+        # Media folder - default to collection.media next to collection file
+        if media_folder:
+            self.media_folder = Path(media_folder)
+        else:
+            self.media_folder = self.db_path.parent / "collection.media"
 
     def close(self):
         """Close the database connection."""
@@ -961,14 +978,14 @@ class SyncableCollection(CollectionSyncInterface):
             out_path: Path to output .apkg file
             deck_id: If provided, only export this deck. Otherwise export all.
             with_scheduling: Include review history and scheduling info
-            with_media: Include media files (not yet implemented)
+            with_media: Include media files from the media folder
             legacy: Use legacy format for older Anki clients
 
         Returns:
             Number of notes exported
         """
         import zipfile
-        import io
+        import re
 
         out_path = Path(out_path)
 
@@ -977,6 +994,31 @@ class SyncableCollection(CollectionSyncInterface):
 
         # Create a temporary collection with only the exported data
         temp_col_bytes = self._create_export_collection(data, with_scheduling, legacy)
+
+        # Find media files referenced in notes
+        media_files = {}  # index -> filename
+        if with_media and self.media_folder.exists():
+            # Regex to find media references: [sound:file.mp3] or <img src="file.jpg">
+            media_pattern = re.compile(
+                r'\[sound:([^\]]+)\]|<img[^>]+src=["\']([^"\']+)["\']'
+            )
+
+            referenced = set()
+            for note in data["notes"]:
+                flds = note.get("flds", "")
+                if isinstance(flds, str):
+                    for match in media_pattern.finditer(flds):
+                        fname = match.group(1) or match.group(2)
+                        if fname:
+                            referenced.add(fname)
+
+            # Check which files exist
+            idx = 0
+            for fname in sorted(referenced):
+                fpath = self.media_folder / fname
+                if fpath.exists() and fpath.is_file():
+                    media_files[str(idx)] = fname
+                    idx += 1
 
         # Build the .apkg ZIP archive
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as zf:
@@ -1001,12 +1043,34 @@ class SyncableCollection(CollectionSyncInterface):
                 dummy_col = self._create_dummy_collection()
                 zf.writestr("collection.anki2", dummy_col)
 
-            # Write media map (empty for now)
-            if legacy:
-                zf.writestr("media", b"{}")
+            # Write media files and index
+            if with_media and media_files:
+                if legacy:
+                    # Legacy format: JSON map of index -> filename
+                    zf.writestr("media", json.dumps(media_files).encode())
+                else:
+                    # Modern format: protobuf MediaEntries
+                    # Field 1 = repeated MediaEntry { field 1 = name, field 2 = size, ... }
+                    media_entries = b""
+                    for idx_str, fname in media_files.items():
+                        # MediaEntry: field 1 = name (string), field 2 = size (varint), field 5 = legacy_zip_filename (varint)
+                        entry = _encode_string(1, fname)
+                        fpath = self.media_folder / fname
+                        entry += _encode_varint_field(2, fpath.stat().st_size)
+                        entry += _encode_varint_field(5, int(idx_str))
+                        media_entries += _encode_bytes(1, entry)
+                    zf.writestr("media", media_entries)
+
+                # Add actual media files
+                for idx_str, fname in media_files.items():
+                    fpath = self.media_folder / fname
+                    zf.write(fpath, idx_str)
             else:
-                # Empty MediaEntries protobuf
-                zf.writestr("media", b"")
+                # Empty media
+                if legacy:
+                    zf.writestr("media", b"{}")
+                else:
+                    zf.writestr("media", b"")
 
         return len(data["notes"])
 
@@ -1575,3 +1639,381 @@ class SyncableCollection(CollectionSyncInterface):
             return temp_path.read_bytes()
         finally:
             temp_path.unlink(missing_ok=True)
+
+    # -------------------------------------------------------------------------
+    # Import Functions
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def from_apkg(
+        cls,
+        apkg_path: str | Path,
+        output_dir: str | Path,
+        extract_media: bool = True,
+    ) -> "SyncableCollection":
+        """
+        Create a new SyncableCollection by importing an .apkg file.
+
+        Args:
+            apkg_path: Path to the .apkg file to import
+            output_dir: Directory to extract the collection to
+            extract_media: Whether to extract media files
+
+        Returns:
+            A new SyncableCollection instance
+
+        Example:
+            col = SyncableCollection.from_apkg("/path/to/deck.apkg", "/path/to/output/")
+            client = SyncClient(col, auth)
+            client.full_upload()
+        """
+        import zipfile
+
+        apkg_path = Path(apkg_path)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        col_path = output_dir / "collection.anki2"
+        media_folder = output_dir / "collection.media"
+
+        with zipfile.ZipFile(apkg_path, "r") as zf:
+            files = zf.namelist()
+
+            # Determine package format and extract collection
+            if "collection.anki21b" in files:
+                # Modern format (zstd compressed)
+                import zstandard as zstd
+
+                compressed = zf.read("collection.anki21b")
+                decompressed = zstd.ZstdDecompressor().decompress(compressed)
+                col_path.write_bytes(decompressed)
+            elif "collection.anki21" in files:
+                # Legacy format (uncompressed)
+                col_path.write_bytes(zf.read("collection.anki21"))
+            elif "collection.anki2" in files:
+                # Very old format
+                col_path.write_bytes(zf.read("collection.anki2"))
+            else:
+                raise ValueError("No collection file found in .apkg")
+
+            # Extract media files
+            if extract_media and "media" in files:
+                media_folder.mkdir(exist_ok=True)
+                media_data = zf.read("media")
+
+                if media_data:
+                    # Try to parse as JSON (legacy format)
+                    try:
+                        media_map = json.loads(media_data)
+                        # Legacy format: {"0": "image.jpg", "1": "audio.mp3", ...}
+                        for idx, fname in media_map.items():
+                            if idx in files:
+                                (media_folder / fname).write_bytes(zf.read(idx))
+                    except json.JSONDecodeError:
+                        # Modern format: protobuf MediaEntries
+                        media_map = cls._parse_media_entries(media_data)
+                        for idx, fname in media_map.items():
+                            if idx in files:
+                                (media_folder / fname).write_bytes(zf.read(idx))
+
+        return cls(col_path, media_folder=media_folder)
+
+    @staticmethod
+    def _parse_media_entries(data: bytes) -> dict[str, str]:
+        """
+        Parse protobuf MediaEntries to get index -> filename mapping.
+
+        MediaEntries { repeated MediaEntry entries = 1 }
+        MediaEntry { string name = 1, uint64 size = 2, ..., uint32 legacy_zip_filename = 5 }
+        """
+        result = {}
+        pos = 0
+
+        while pos < len(data):
+            # Read tag
+            if pos >= len(data):
+                break
+            tag, pos = _read_varint(data, pos)
+            field_num = tag >> 3
+            wire_type = tag & 0x07
+
+            if wire_type == 2:  # LEN (embedded message)
+                length, pos = _read_varint(data, pos)
+                if field_num == 1:  # MediaEntry
+                    entry_data = data[pos : pos + length]
+                    entry_fields = _parse_protobuf_fields(entry_data)
+
+                    # Get name (field 1) and legacy_zip_filename (field 5)
+                    name = _get_str(entry_fields, 1, "")
+                    legacy_idx = _get_int(entry_fields, 5, -1)
+
+                    if name and legacy_idx >= 0:
+                        result[str(legacy_idx)] = name
+
+                pos += length
+            elif wire_type == 0:  # VARINT
+                _, pos = _read_varint(data, pos)
+            elif wire_type == 5:  # I32
+                pos += 4
+            elif wire_type == 1:  # I64
+                pos += 8
+            else:
+                break
+
+        return result
+
+    def import_apkg(
+        self,
+        apkg_path: str | Path,
+        import_media: bool = True,
+        merge_notetypes: bool = True,
+    ) -> dict:
+        """
+        Import notes and cards from an .apkg file into this collection.
+
+        This merges the content from the .apkg into the existing collection,
+        useful for adding decks to an existing collection before uploading.
+
+        Args:
+            apkg_path: Path to the .apkg file to import
+            import_media: Whether to import media files
+            merge_notetypes: Whether to merge notetypes or skip duplicates
+
+        Returns:
+            Dict with 'notes', 'cards', 'media' counts
+
+        Example:
+            col = SyncableCollection("/path/to/collection.anki2")
+            stats = col.import_apkg("/path/to/deck.apkg")
+            print(f"Imported {stats['notes']} notes")
+        """
+        import zipfile
+        import tempfile
+
+        apkg_path = Path(apkg_path)
+        stats = {"notes": 0, "cards": 0, "media": 0, "notetypes": 0, "decks": 0}
+
+        with zipfile.ZipFile(apkg_path, "r") as zf:
+            files = zf.namelist()
+
+            # Extract collection to temp file
+            with tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as f:
+                temp_col_path = Path(f.name)
+
+            try:
+                # Determine format and extract
+                if "collection.anki21b" in files:
+                    import zstandard as zstd
+
+                    compressed = zf.read("collection.anki21b")
+                    decompressed = zstd.ZstdDecompressor().decompress(compressed)
+                    temp_col_path.write_bytes(decompressed)
+                elif "collection.anki21" in files:
+                    temp_col_path.write_bytes(zf.read("collection.anki21"))
+                elif "collection.anki2" in files:
+                    temp_col_path.write_bytes(zf.read("collection.anki2"))
+                else:
+                    raise ValueError("No collection file found in .apkg")
+
+                # Open source collection
+                src_db = _connect_db(temp_col_path)
+
+                try:
+                    # Import notetypes
+                    stats["notetypes"] = self._import_notetypes(src_db, merge_notetypes)
+
+                    # Import decks
+                    stats["decks"] = self._import_decks(src_db)
+
+                    # Import notes
+                    stats["notes"] = self._import_notes(src_db)
+
+                    # Import cards
+                    stats["cards"] = self._import_cards(src_db)
+
+                    self.db.commit()
+                finally:
+                    src_db.close()
+
+            finally:
+                temp_col_path.unlink(missing_ok=True)
+
+            # Import media files
+            if import_media and "media" in files and self.media_folder:
+                self.media_folder.mkdir(exist_ok=True)
+                media_data = zf.read("media")
+
+                if media_data:
+                    try:
+                        media_map = json.loads(media_data)
+                    except json.JSONDecodeError:
+                        media_map = self._parse_media_entries(media_data)
+
+                    for idx, fname in media_map.items():
+                        if idx in files:
+                            dest = self.media_folder / fname
+                            if not dest.exists():
+                                dest.write_bytes(zf.read(idx))
+                                stats["media"] += 1
+
+        # Update modification time
+        self.db.execute(
+            "UPDATE col SET mod = ? WHERE id = 1", (int(time.time() * 1000),)
+        )
+        self.db.commit()
+
+        return stats
+
+    def _import_notetypes(self, src_db: sqlite3.Connection, merge: bool) -> int:
+        """Import notetypes from source database."""
+        count = 0
+        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM notetypes")}
+
+        for row in src_db.execute(
+            "SELECT id, name, mtime_secs, usn, config FROM notetypes"
+        ):
+            ntid = row[0]
+            if ntid in existing_ids:
+                if not merge:
+                    continue
+                # Update existing
+                self.db.execute(
+                    "UPDATE notetypes SET name=?, mtime_secs=?, usn=-1, config=? WHERE id=?",
+                    (row[1], row[2], row[4], ntid),
+                )
+            else:
+                # Insert new
+                self.db.execute(
+                    "INSERT INTO notetypes (id, name, mtime_secs, usn, config) VALUES (?, ?, ?, -1, ?)",
+                    (ntid, row[1], row[2], row[4]),
+                )
+                count += 1
+
+            # Import fields
+            self.db.execute("DELETE FROM fields WHERE ntid = ?", (ntid,))
+            for frow in src_db.execute(
+                "SELECT ntid, ord, name, config FROM fields WHERE ntid = ?", (ntid,)
+            ):
+                self.db.execute(
+                    "INSERT INTO fields (ntid, ord, name, config) VALUES (?, ?, ?, ?)",
+                    frow,
+                )
+
+            # Import templates
+            self.db.execute("DELETE FROM templates WHERE ntid = ?", (ntid,))
+            for trow in src_db.execute(
+                "SELECT ntid, ord, name, mtime_secs, usn, config FROM templates WHERE ntid = ?",
+                (ntid,),
+            ):
+                self.db.execute(
+                    "INSERT INTO templates (ntid, ord, name, mtime_secs, usn, config) VALUES (?, ?, ?, ?, -1, ?)",
+                    (trow[0], trow[1], trow[2], trow[3], trow[5]),
+                )
+
+        return count
+
+    def _import_decks(self, src_db: sqlite3.Connection) -> int:
+        """Import decks from source database."""
+        count = 0
+        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM decks")}
+
+        for row in src_db.execute(
+            "SELECT id, name, mtime_secs, usn, common, kind FROM decks"
+        ):
+            did = row[0]
+            if did in existing_ids:
+                # Update existing
+                self.db.execute(
+                    "UPDATE decks SET name=?, mtime_secs=?, usn=-1, common=?, kind=? WHERE id=?",
+                    (row[1], row[2], row[4], row[5], did),
+                )
+            else:
+                # Insert new
+                self.db.execute(
+                    "INSERT INTO decks (id, name, mtime_secs, usn, common, kind) VALUES (?, ?, ?, -1, ?, ?)",
+                    (did, row[1], row[2], row[4], row[5]),
+                )
+                count += 1
+
+        return count
+
+    def _import_notes(self, src_db: sqlite3.Connection) -> int:
+        """Import notes from source database."""
+        count = 0
+        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM notes")}
+        existing_guids = {row[0] for row in self.db.execute("SELECT guid FROM notes")}
+
+        for row in src_db.execute(
+            "SELECT id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data FROM notes"
+        ):
+            nid, guid = row[0], row[1]
+
+            # Skip if already exists (by ID or GUID)
+            if nid in existing_ids or guid in existing_guids:
+                continue
+
+            # Insert with usn=-1 to mark as pending sync
+            self.db.execute(
+                """INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data)
+                   VALUES (?, ?, ?, ?, -1, ?, ?, ?, ?, ?, ?)""",
+                (
+                    nid,
+                    guid,
+                    row[2],
+                    row[3],
+                    row[5],
+                    row[6],
+                    row[7],
+                    row[8],
+                    row[9],
+                    row[10],
+                ),
+            )
+            count += 1
+
+        return count
+
+    def _import_cards(self, src_db: sqlite3.Connection) -> int:
+        """Import cards from source database."""
+        count = 0
+        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM cards")}
+        existing_notes = {row[0] for row in self.db.execute("SELECT id FROM notes")}
+
+        for row in src_db.execute(
+            """SELECT id, nid, did, ord, mod, usn, type, queue, due, ivl,
+                      factor, reps, lapses, left, odue, odid, flags, data FROM cards"""
+        ):
+            cid, nid = row[0], row[1]
+
+            # Skip if already exists or note doesn't exist
+            if cid in existing_ids or nid not in existing_notes:
+                continue
+
+            # Insert with usn=-1 to mark as pending sync
+            self.db.execute(
+                """INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl,
+                                      factor, reps, lapses, left, odue, odid, flags, data)
+                   VALUES (?, ?, ?, ?, ?, -1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    cid,
+                    nid,
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[6],
+                    row[7],
+                    row[8],
+                    row[9],
+                    row[10],
+                    row[11],
+                    row[12],
+                    row[13],
+                    row[14],
+                    row[15],
+                    row[16],
+                    row[17],
+                ),
+            )
+            count += 1
+
+        return count

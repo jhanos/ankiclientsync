@@ -32,6 +32,11 @@ from .client import (
     Chunk,
     UnchunkedChanges,
     SanityCheckCounts,
+    # Media sync
+    MediaEntry,
+    MediaChange,
+    MediaAction,
+    MediaSyncClient,
     # Exceptions
     SyncError,
     SyncRedirectError,
@@ -54,6 +59,10 @@ __all__ = [
     "Chunk",
     "UnchunkedChanges",
     "SanityCheckCounts",
+    "MediaEntry",
+    "MediaChange",
+    "MediaAction",
+    "MediaSyncClient",
     "SyncError",
     "SyncRedirectError",
     "SanityCheckFailedError",
