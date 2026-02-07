@@ -3,7 +3,7 @@
 # License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 """
-Download collection from server to a file in /tmp/.
+Download collection from server and export to .apkg file.
 
 Usage: uv run --env-file tests/.env python -m ankiclientsync.tests.test_download
 """
@@ -21,27 +21,27 @@ from .conftest import (
 
 
 def main():
-    print(f"{'=' * 60}\nANKI SYNC CLIENT - DOWNLOAD\n{'=' * 60}")
+    print(f"{'=' * 60}\nANKI SYNC CLIENT - DOWNLOAD & EXPORT\n{'=' * 60}")
     print(f"Endpoint: {ENDPOINT}")
 
     if not check_dependencies():
         return False
 
     # Login
-    print("\n[1/2] Logging in...")
+    print("\n[1/3] Logging in...")
     auth = login()
     if not auth:
         print("ERROR: Login failed")
         return False
 
     # Create empty collection in /tmp/
-    print("\n[2/2] Downloading collection from server...")
-    output_path = Path(tempfile.gettempdir()) / "collection.anki2"
+    print("\n[2/3] Downloading collection from server...")
+    col_path = Path(tempfile.gettempdir()) / "collection.anki2"
 
     # Create a minimal empty collection database for download
-    _create_empty_collection(output_path)
+    _create_empty_collection(col_path)
 
-    col = SyncableCollection(output_path)
+    col = SyncableCollection(col_path)
     client = SyncClient(col, auth)
 
     try:
@@ -49,12 +49,20 @@ def main():
         notes = col.count("notes")
         cards = col.count("cards")
         print(f"  Downloaded: {notes} notes, {cards} cards")
-        print(f"  Saved to: {output_path}")
+        print(f"  Saved to: {col_path}")
+
+        # Export to .apkg
+        print("\n[3/3] Exporting to .apkg...")
+        apkg_path = Path(tempfile.gettempdir()) / "collection.apkg"
+        exported_notes = col.export_anki_package(apkg_path)
+        print(f"  Exported: {exported_notes} notes")
+        print(f"  Saved to: {apkg_path}")
+
     finally:
         col.close()
         client.close()
 
-    print(f"\nSUCCESS: Downloaded collection to {output_path}")
+    print(f"\nSUCCESS: Downloaded and exported to {apkg_path}")
     return True
 
 
