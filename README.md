@@ -59,6 +59,9 @@ uv run --env-file tests/.env python -m ankiclientsync.tests.test_upload
 
 # Run download tests (download, modify, and re-upload)
 uv run --env-file tests/.env python -m ankiclientsync.tests.test_download
+
+# Run partial sync tests (sync with server, modify, and re-sync)
+uv run --env-file tests/.env python -m ankiclientsync.tests.test_partial_sync
 ```
 
 You can customize the test configuration by editing `tests/.env`:

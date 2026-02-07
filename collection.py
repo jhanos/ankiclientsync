@@ -501,7 +501,25 @@ class SyncableCollection(CollectionSyncInterface):
         return self.db_path
 
     def close_for_full_upload(self) -> bytes:
-        """Close database and return contents for upload."""
+        """Close database and return contents for upload.
+
+        Before closing, resets all pending USNs to 0 and clears graves,
+        since after a full upload everything is in sync with the server.
+        """
+        # Reset all pending items to synced state (usn = 0)
+        self.db.execute("UPDATE notes SET usn = 0 WHERE usn = -1")
+        self.db.execute("UPDATE cards SET usn = 0 WHERE usn = -1")
+        self.db.execute("UPDATE decks SET usn = 0 WHERE usn = -1")
+        self.db.execute("UPDATE notetypes SET usn = 0 WHERE usn = -1")
+        self.db.execute("UPDATE deck_config SET usn = 0 WHERE usn = -1")
+        self.db.execute("UPDATE tags SET usn = 0 WHERE usn = -1")
+        self.db.execute("UPDATE revlog SET usn = 0 WHERE usn = -1")
+        # Clear graves - they've been uploaded with the collection
+        self.db.execute("DELETE FROM graves")
+        # Reset collection USN to 0
+        self.db.execute("UPDATE col SET usn = 0 WHERE id = 1")
+        self.db.commit()
+
         self.db.close()
         return self.db_path.read_bytes()
 

@@ -12,8 +12,11 @@ Usage:
     uv run --env-file tests/.env python -m ankiclientsync.tests.test_partial_sync
 """
 
+import shutil
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 from .. import SyncActionRequired, SyncClient, SyncableCollection
 from .conftest import (
@@ -27,61 +30,75 @@ from .conftest import (
 )
 
 
+def _create_temp_collection() -> tuple[Path, Path]:
+    """Create a temporary copy of the test collection.
+
+    Returns (work_dir, collection_path) where collection_path is the copy.
+    """
+    work_dir = Path(tempfile.mkdtemp())
+    col_copy = work_dir / "collection.anki2"
+    shutil.copy(COLLECTION_PATH, col_copy)
+    return work_dir, col_copy
+
+
+def _reset_server_and_sync(
+    auth, col_path: Path
+) -> tuple[SyncableCollection, SyncClient]:
+    """Reset server with a full upload and return a synced collection.
+
+    This ensures each test starts with a clean, synchronized state.
+    """
+    col = SyncableCollection(col_path)
+    client = SyncClient(col, auth)
+
+    # Always do a full upload to reset server state
+    print("  Resetting server with full upload...")
+    client.full_upload()
+
+    # Reopen the collection (it was closed during upload)
+    col = SyncableCollection(col_path)
+    client = SyncClient(col, auth)
+
+    return col, client
+
+
 def test_partial_sync_no_changes(auth) -> bool:
     """Test partial sync when there are no local changes."""
     print("  Testing partial sync with no local changes...")
 
-    # First do a full upload to ensure server has our collection
-    col = SyncableCollection(COLLECTION_PATH)
-    client = SyncClient(col, auth)
+    work_dir, col_path = _create_temp_collection()
+    col = None
+    client = None
 
     try:
-        result = client.sync()
-        print(f"  Initial sync result: {result.required}")
-
-        if result.required == SyncActionRequired.FULL_SYNC:
-            print("  Full sync required, uploading...")
-            client.full_upload()
-
-            # Reopen and sync again
-            col = SyncableCollection(COLLECTION_PATH)
-            client = SyncClient(col, auth)
-            result = client.sync()
-            print(f"  Post-upload sync result: {result.required}")
+        # Reset server and get synced collection
+        col, client = _reset_server_and_sync(auth, col_path)
 
         # Now sync again - should be NO_CHANGES
-        col.close()
-        col = SyncableCollection(COLLECTION_PATH)
-        client = SyncClient(col, auth)
         result = client.sync()
-        print(f"  Second sync result: {result.required}")
+        print(f"  Sync result: {result.required}")
 
         return result.required == SyncActionRequired.NO_CHANGES
 
     finally:
-        col.close()
-        client.close()
+        if col:
+            col.close()
+        if client:
+            client.close()
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def test_partial_sync_with_local_changes(auth) -> bool:
     """Test partial sync after adding a local note."""
     print("  Testing partial sync with local changes...")
 
-    col = SyncableCollection(COLLECTION_PATH)
-    client = SyncClient(col, auth)
+    work_dir, col_path = _create_temp_collection()
+    col = None
+    client = None
 
     try:
-        # First sync to get current state
-        result = client.sync()
-        print(f"  Initial sync result: {result.required}")
-
-        if result.required == SyncActionRequired.FULL_SYNC:
-            print("  Full sync required, uploading...")
-            client.full_upload()
-
-            # Reopen
-            col = SyncableCollection(COLLECTION_PATH)
-            client = SyncClient(col, auth)
+        # Reset server and get synced collection
+        col, client = _reset_server_and_sync(auth, col_path)
 
         # Add a new note locally
         timestamp = int(time.time())
@@ -90,7 +107,7 @@ def test_partial_sync_with_local_changes(auth) -> bool:
         note_id = col.add_note(front, back)
         print(f"  Added note {note_id}: {front}")
 
-        # Count pending items
+        # Count pending items (should only be 1 note and 1 card)
         pending_notes = col.db.execute(
             "SELECT COUNT(*) FROM notes WHERE usn = -1"
         ).fetchone()[0]
@@ -119,27 +136,26 @@ def test_partial_sync_with_local_changes(auth) -> bool:
         return result.required == SyncActionRequired.NO_CHANGES
 
     finally:
-        col.close()
-        client.close()
+        if col:
+            col.close()
+        if client:
+            client.close()
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def test_partial_sync_roundtrip(auth) -> bool:
     """Test that changes sync correctly in both directions."""
     print("  Testing partial sync roundtrip...")
 
-    # First, sync collection to server
-    col1 = SyncableCollection(COLLECTION_PATH)
-    client1 = SyncClient(col1, auth)
+    work_dir, col_path = _create_temp_collection()
+    col1 = None
+    client1 = None
+    col2 = None
+    client2 = None
 
     try:
-        result = client1.sync()
-        print(f"  Initial sync: {result.required}")
-
-        if result.required == SyncActionRequired.FULL_SYNC:
-            print("  Full sync required, uploading...")
-            client1.full_upload()
-            col1 = SyncableCollection(COLLECTION_PATH)
-            client1 = SyncClient(col1, auth)
+        # Reset server and get synced collection
+        col1, client1 = _reset_server_and_sync(auth, col_path)
 
         # Add a note
         timestamp = int(time.time())
@@ -159,9 +175,11 @@ def test_partial_sync_roundtrip(auth) -> bool:
 
         col1.close()
         client1.close()
+        col1 = None
+        client1 = None
 
-        # Now download from server and verify
-        col2 = SyncableCollection(COLLECTION_PATH)
+        # Now reopen and sync again to verify the note persisted
+        col2 = SyncableCollection(col_path)
         client2 = SyncClient(col2, auth)
 
         result = client2.sync()
@@ -174,13 +192,9 @@ def test_partial_sync_roundtrip(auth) -> bool:
 
         if row:
             print(f"  Found synced note: {row['flds'][:50]}...")
-            col2.close()
-            client2.close()
             return True
         else:
             print("  ERROR: Synced note not found in second collection")
-            col2.close()
-            client2.close()
             return False
 
     except Exception as e:
@@ -190,11 +204,15 @@ def test_partial_sync_roundtrip(auth) -> bool:
         traceback.print_exc()
         return False
     finally:
-        try:
+        if col1:
             col1.close()
+        if client1:
             client1.close()
-        except:
-            pass
+        if col2:
+            col2.close()
+        if client2:
+            client2.close()
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def main():
