@@ -42,6 +42,7 @@ from .client import (
     # Interface
     CollectionSyncInterface,
 )
+from .collection import SyncableCollection
 
 __all__ = [
     "SyncAuth",
@@ -59,6 +60,7 @@ __all__ = [
     "HttpSyncClient",
     "SyncClient",
     "CollectionSyncInterface",
+    "SyncableCollection",
 ]
 
 __version__ = "1.0.0"
