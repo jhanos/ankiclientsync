@@ -1339,31 +1339,78 @@ class SyncableCollection(CollectionSyncInterface):
                 usn INTEGER NOT NULL
             );
 
+            -- Config (modern schema - required by AnkiDroid)
+            CREATE TABLE config (
+                KEY TEXT NOT NULL PRIMARY KEY,
+                usn INTEGER NOT NULL,
+                mtime_secs INTEGER NOT NULL,
+                val BLOB NOT NULL
+            ) WITHOUT ROWID;
+
             -- Indexes
-            CREATE INDEX ix_notes_mid ON notes (mid);
+            CREATE INDEX idx_notes_mid ON notes (mid);
             CREATE INDEX ix_notes_usn ON notes (usn);
             CREATE INDEX ix_notes_csum ON notes (csum);
             CREATE INDEX ix_cards_nid ON cards (nid);
-            CREATE INDEX ix_cards_did ON cards (did);
-            CREATE INDEX ix_cards_usn ON cards (usn);
             CREATE INDEX ix_cards_sched ON cards (did, queue, due);
+            CREATE INDEX ix_cards_usn ON cards (usn);
+            CREATE INDEX idx_cards_odid ON cards (odid) WHERE odid != 0;
             CREATE INDEX ix_revlog_cid ON revlog (cid);
             CREATE INDEX ix_revlog_usn ON revlog (usn);
+            CREATE INDEX idx_decks_name ON decks (name);
+            CREATE INDEX idx_notetypes_name ON notetypes (name);
+            CREATE INDEX idx_notetypes_usn ON notetypes (usn);
+            CREATE INDEX idx_fields_name_ntid ON fields (name, ntid);
+            CREATE INDEX idx_templates_name_ntid ON templates (name, ntid);
+            CREATE INDEX idx_templates_usn ON templates (usn);
+            CREATE INDEX idx_graves_pending ON graves (usn);
         """)
 
         # Get creation time from source collection
         crt = self.db.execute("SELECT crt FROM col WHERE id = 1").fetchone()
         crt = crt[0] if crt else int(time.time())
 
-        # Insert col row
+        # Insert col row - use empty strings for modern schema
         mod = int(time.time() * 1000)
         scm = mod
         ver = 11 if legacy else 18
         db.execute(
             """INSERT INTO col (id, crt, mod, scm, ver, dty, usn, ls, conf, models, decks, dconf, tags)
-               VALUES (1, ?, ?, ?, ?, 0, 0, 0, '{}', '{}', '{}', '{}', '{}')""",
+               VALUES (1, ?, ?, ?, ?, 0, 0, 0, '', '', '', '', '')""",
             (crt, mod, scm, ver),
         )
+
+        # Insert required config entries for modern Anki/AnkiDroid
+        # Get local timezone offset in minutes
+        import datetime
+
+        tz_offset = int(
+            -datetime.datetime.now().astimezone().utcoffset().total_seconds() / 60
+        )
+
+        config_entries = [
+            ("activeDecks", b"[1]"),
+            ("curDeck", b"1"),
+            ("newSpread", b"0"),
+            ("collapseTime", b"1200"),
+            ("timeLim", b"0"),
+            ("estTimes", b"true"),
+            ("dueCounts", b"true"),
+            ("addToCur", b"true"),
+            ("sortType", b'"noteFld"'),
+            ("sortBackwards", b"false"),
+            ("schedVer", b"2"),
+            ("sched2021", b"true"),
+            ("dayLearnFirst", b"false"),
+            ("nextPos", b"1"),
+            ("creationOffset", str(tz_offset).encode()),
+        ]
+        for key, val in config_entries:
+            db.execute(
+                "INSERT INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
+                (key, val),
+            )
+
         db.commit()
         db.close()
 
@@ -1473,11 +1520,35 @@ class SyncableCollection(CollectionSyncInterface):
                 )
 
         # Insert notetypes
+        first_notetype_id = None
         for nt in data["notetypes"]:
-            # Build config protobuf
+            if first_notetype_id is None:
+                first_notetype_id = nt["id"]
+
+            # Build config protobuf with all required fields
             nt_config = b""
+            # Field 3 = CSS
             if css := nt.get("css", ""):
                 nt_config += _encode_string(3, css)
+
+            # Field 5 (0x2a) = LaTeX configuration (required by AnkiDroid)
+            # Default LaTeX preamble
+            latex_pre = r"""\documentclass[12pt]{article}
+\special{papersize=3in,5in}
+\usepackage[utf8]{inputenc}
+\usepackage{amssymb,amsmath}
+\pagestyle{empty}
+\setlength{\parindent}{0in}
+\begin{document}
+"""
+            latex_post = r"\end{document}"
+            nt_config += _encode_string(5, latex_pre)
+            # Field 6 = LaTeX post
+            nt_config += _encode_string(6, latex_post)
+
+            # Field 8 (0x42) = additional config bytes
+            # Field 9 (0x48) = type (0 = standard, 1 = cloze)
+            nt_config += _encode_varint_field(9, nt.get("type", 0))
 
             db.execute(
                 """INSERT INTO notetypes (id, name, mtime_secs, usn, config)
@@ -1511,6 +1582,13 @@ class SyncableCollection(CollectionSyncInterface):
                        VALUES (?, ?, ?, 0, 0, ?)""",
                     (nt["id"], tmpl.get("ord", 0), tmpl["name"], tmpl_config),
                 )
+
+        # Update curModel in config table if we have notetypes
+        if first_notetype_id is not None:
+            db.execute(
+                "INSERT INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
+                ("curModel", str(first_notetype_id).encode()),
+            )
 
         # Insert decks
         for deck in data["decks"]:

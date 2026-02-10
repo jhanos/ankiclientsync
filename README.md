@@ -132,6 +132,48 @@ client.sync()  # or client.full_upload()
 col.close()
 ```
 
+### Full Example: Import .apkg and Upload to Server
+
+Complete workflow to import an Anki package file and sync it to your server:
+
+```python
+from ankiclientsync import SyncClient, SyncableCollection, MediaSyncClient
+from pathlib import Path
+import tempfile
+
+# Setup working directory
+work_dir = Path(tempfile.mkdtemp())
+col_path = work_dir / "collection.anki2"
+media_folder = work_dir / "collection.media"
+
+# Import .apkg to create a new collection (extracts media automatically)
+col = SyncableCollection.from_apkg(
+    "/path/to/shared_deck.apkg",
+    work_dir,
+    extract_media=True
+)
+print(f"Imported {col.count('notes')} notes, {col.count('cards')} cards")
+
+# Login to sync server
+auth = SyncClient.login("user", "pass", endpoint="http://localhost:8080/")
+
+# Upload collection to server
+client = SyncClient(col, auth)
+client.full_upload()
+print("Collection uploaded to server")
+
+# Upload media files
+if media_folder.exists() and any(media_folder.iterdir()):
+    media = MediaSyncClient(media_folder, auth)
+    media.register_local_changes()
+    stats = media.sync()
+    print(f"Media uploaded: {stats['uploaded']} files")
+    media.close()
+
+col.close()
+client.close()
+```
+
 ### Full Example: Download and Export
 
 ```python
