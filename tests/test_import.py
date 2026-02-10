@@ -41,6 +41,10 @@ def main():
     runner.run("Import from .apkg (from_apkg)", lambda: test_from_apkg(auth))
     runner.run("Merge import (import_apkg)", lambda: test_merge_import(auth))
     runner.run("Import and upload to server", lambda: test_import_and_upload(auth))
+    runner.run(
+        "Import Android .apkg and upload",
+        lambda: test_import_android_apkg_and_upload(auth),
+    )
 
     return runner.summary()
 
@@ -248,6 +252,78 @@ def test_import_and_upload(auth):
                 print(
                     f"  WARNING: Note count changed: {server_notes} -> {verified_notes}"
                 )
+
+        finally:
+            verify_col.close()
+            verify_client.close()
+
+    return True
+
+
+def test_import_android_apkg_and_upload(auth):
+    """Test importing an Android-exported .apkg and uploading to server."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        # Use the Android-exported .apkg from test fixtures
+        android_apkg = Path(__file__).parent / "collection_android.apkg"
+        if not android_apkg.exists():
+            print(f"  SKIP: {android_apkg} not found")
+            return True
+
+        print(f"  Importing: {android_apkg}")
+
+        # Import .apkg into new collection
+        import_dir = tmpdir / "android_import"
+        col = SyncableCollection.from_apkg(android_apkg, import_dir)
+
+        try:
+            notes = col.count("notes")
+            cards = col.count("cards")
+            notetypes = col.count("notetypes")
+            decks = col.count("decks")
+            print(f"  Imported: {notes} notes, {cards} cards")
+            print(f"  Notetypes: {notetypes}, Decks: {decks}")
+
+            # Verify collection has required structure
+            if notes == 0:
+                print("  WARNING: No notes in Android .apkg")
+
+            # Upload to server
+            client = SyncClient(col, auth)
+            try:
+                client.full_upload()
+                print("  Uploaded to server successfully")
+            finally:
+                client.close()
+
+        finally:
+            col.close()
+
+        # Verify by downloading and checking
+        verify_path = tmpdir / "verify.anki2"
+        _create_empty_collection(verify_path)
+
+        verify_col = SyncableCollection(verify_path)
+        verify_client = SyncClient(verify_col, auth)
+
+        try:
+            verify_client.full_download()
+            verified_notes = verify_col.count("notes")
+            verified_cards = verify_col.count("cards")
+            print(f"  Verified server: {verified_notes} notes, {verified_cards} cards")
+
+            if verified_notes != notes:
+                print(
+                    f"  ERROR: Note count mismatch: expected {notes}, got {verified_notes}"
+                )
+                return False
+
+            if verified_cards != cards:
+                print(
+                    f"  ERROR: Card count mismatch: expected {cards}, got {verified_cards}"
+                )
+                return False
 
         finally:
             verify_col.close()

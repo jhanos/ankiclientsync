@@ -1761,9 +1761,13 @@ class SyncableCollection(CollectionSyncInterface):
             if "collection.anki21b" in files:
                 # Modern format (zstd compressed)
                 import zstandard as zstd
+                import io
 
                 compressed = zf.read("collection.anki21b")
-                decompressed = zstd.ZstdDecompressor().decompress(compressed)
+                # Use streaming decompression to handle files without content size
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(io.BytesIO(compressed)) as reader:
+                    decompressed = reader.read()
                 col_path.write_bytes(decompressed)
             elif "collection.anki21" in files:
                 # Legacy format (uncompressed)
@@ -1780,6 +1784,16 @@ class SyncableCollection(CollectionSyncInterface):
                 media_data = zf.read("media")
 
                 if media_data:
+                    # Check if media data is zstd-compressed (magic bytes: 28 b5 2f fd)
+                    if media_data[:4] == b"\x28\xb5\x2f\xfd":
+                        import zstandard as zstd
+                        import io
+
+                        dctx = zstd.ZstdDecompressor()
+                        # Use streaming decompression to handle files without content size
+                        with dctx.stream_reader(io.BytesIO(media_data)) as reader:
+                            media_data = reader.read()
+
                     # Try to parse as JSON (legacy format)
                     try:
                         media_map = json.loads(media_data)
