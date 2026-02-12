@@ -1592,8 +1592,10 @@ class SyncableCollection(CollectionSyncInterface):
 
         # Insert decks
         for deck in data["decks"]:
-            # Build common protobuf
-            common = _encode_varint_field(1, 0) + _encode_varint_field(2, 0)
+            # Build common protobuf (DeckCommon message)
+            # Field 1: study_collapsed (bool), Field 2: browser_collapsed (bool)
+            # Use 1 (true) to match AnkiDroid's default behavior
+            common = _encode_varint_field(1, 1) + _encode_varint_field(2, 1)
 
             # Build kind protobuf
             is_filtered = deck.get("dyn", 0) == 1
