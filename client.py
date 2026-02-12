@@ -121,7 +121,7 @@ class Chunk:
     """Chunk of sync data."""
 
     done: bool = False
-    revlog: list[dict] = field(default_factory=list)
+    revlog: list[list] = field(default_factory=list)
     cards: list[list] = field(default_factory=list)
     notes: list[list] = field(default_factory=list)
 

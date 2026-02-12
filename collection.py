@@ -453,9 +453,9 @@ class SyncableCollection(CollectionSyncInterface):
             rid = ids["revlog"].pop()
             revlog_data = self._get_revlog_for_sync(rid)
             if revlog_data:
-                # Update USN in the data we send
+                # Update USN in the data we send (USN is at index 2)
                 if server_usn is not None:
-                    revlog_data["usn"] = server_usn
+                    revlog_data[2] = server_usn
                     self.db.execute(
                         "UPDATE revlog SET usn = ? WHERE id = ?", (server_usn, rid)
                     )
@@ -867,8 +867,11 @@ class SyncableCollection(CollectionSyncInterface):
             tuple(card_data),
         )
 
-    def _get_revlog_for_sync(self, rid: int) -> Optional[dict]:
-        """Get revlog entry as dict for sync protocol."""
+    def _get_revlog_for_sync(self, rid: int) -> Optional[list]:
+        """Get revlog entry as list for sync protocol.
+
+        Format: [id, cid, usn, ease, ivl, lastIvl, factor, time, type]
+        """
         row = self.db.execute(
             """SELECT id, cid, usn, ease, ivl, lastIvl, factor, time, type
                FROM revlog WHERE id = ?""",
@@ -877,35 +880,18 @@ class SyncableCollection(CollectionSyncInterface):
         if not row:
             return None
 
-        return {
-            "id": row["id"],
-            "cid": row["cid"],
-            "usn": row["usn"],
-            "ease": row["ease"],
-            "ivl": row["ivl"],
-            "lastIvl": row["lastIvl"],
-            "factor": row["factor"],
-            "time": row["time"],
-            "type": row["type"],
-        }
+        return list(row)
 
-    def _apply_revlog(self, revlog_data: dict) -> None:
-        """Apply revlog entry from server."""
+    def _apply_revlog(self, revlog_data: list) -> None:
+        """Apply revlog entry from server.
+
+        revlog_data format: [id, cid, usn, ease, ivl, lastIvl, factor, time, type]
+        """
         self.db.execute(
             """INSERT OR REPLACE INTO revlog 
                (id, cid, usn, ease, ivl, lastIvl, factor, time, type)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                revlog_data["id"],
-                revlog_data["cid"],
-                revlog_data["usn"],
-                revlog_data["ease"],
-                revlog_data["ivl"],
-                revlog_data["lastIvl"],
-                revlog_data["factor"],
-                revlog_data["time"],
-                revlog_data["type"],
-            ),
+            tuple(revlog_data),
         )
 
     # -------------------------------------------------------------------------
@@ -1155,6 +1141,40 @@ class SyncableCollection(CollectionSyncInterface):
                 ):
                     data["revlog"].append(dict(row))
 
+        # Get config entries from source collection
+        data["config"] = []
+        try:
+            for row in self.db.execute("SELECT key, usn, mtime_secs, val FROM config"):
+                data["config"].append(
+                    {
+                        "key": row["key"],
+                        "usn": row["usn"],
+                        "mtime_secs": row["mtime_secs"],
+                        "val": row["val"],
+                    }
+                )
+        except Exception:
+            pass  # Config table may not exist in older collections
+
+        # Get raw deck data (preserving common bytes for study statistics)
+        data["decks_raw"] = []
+        for did in deck_ids:
+            row = self.db.execute(
+                "SELECT id, name, mtime_secs, usn, common, kind FROM decks WHERE id = ?",
+                (did,),
+            ).fetchone()
+            if row:
+                data["decks_raw"].append(
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "mtime_secs": row["mtime_secs"],
+                        "usn": row["usn"],
+                        "common": row["common"],
+                        "kind": row["kind"],
+                    }
+                )
+
         return data
 
     def _get_deck_and_children_ids(self, deck_id: int) -> list[int]:
@@ -1195,6 +1215,14 @@ class SyncableCollection(CollectionSyncInterface):
             temp_db = _connect_db(temp_path)
             try:
                 self._insert_export_data(temp_db, data, with_scheduling, legacy)
+                temp_db.commit()
+                # Run ANALYZE to create sqlite_stat1 and sqlite_stat4 tables
+                # STAT4 requires enabling it first (SQLite compile-time option or pragma)
+                try:
+                    temp_db.execute("PRAGMA analysis_limit=1000")
+                except Exception:
+                    pass
+                temp_db.execute("ANALYZE")
                 temp_db.commit()
             finally:
                 temp_db.close()
@@ -1380,36 +1408,7 @@ class SyncableCollection(CollectionSyncInterface):
             (crt, mod, scm, ver),
         )
 
-        # Insert required config entries for modern Anki/AnkiDroid
-        # Get local timezone offset in minutes
-        import datetime
-
-        tz_offset = int(
-            -datetime.datetime.now().astimezone().utcoffset().total_seconds() / 60
-        )
-
-        config_entries = [
-            ("activeDecks", b"[1]"),
-            ("curDeck", b"1"),
-            ("newSpread", b"0"),
-            ("collapseTime", b"1200"),
-            ("timeLim", b"0"),
-            ("estTimes", b"true"),
-            ("dueCounts", b"true"),
-            ("addToCur", b"true"),
-            ("sortType", b'"noteFld"'),
-            ("sortBackwards", b"false"),
-            ("schedVer", b"2"),
-            ("sched2021", b"true"),
-            ("dayLearnFirst", b"false"),
-            ("nextPos", b"1"),
-            ("creationOffset", str(tz_offset).encode()),
-        ]
-        for key, val in config_entries:
-            db.execute(
-                "INSERT INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
-                (key, val),
-            )
+        # Note: Config entries are now inserted in _insert_export_data to preserve source values
 
         db.commit()
         db.close()
@@ -1583,34 +1582,134 @@ class SyncableCollection(CollectionSyncInterface):
                     (nt["id"], tmpl.get("ord", 0), tmpl["name"], tmpl_config),
                 )
 
-        # Update curModel in config table if we have notetypes
-        if first_notetype_id is not None:
-            db.execute(
-                "INSERT INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
-                ("curModel", str(first_notetype_id).encode()),
-            )
+        # Insert config entries from source collection (preserving original values)
+        if data.get("config"):
+            for cfg in data["config"]:
+                db.execute(
+                    "INSERT OR REPLACE INTO config (KEY, usn, mtime_secs, val) VALUES (?, ?, ?, ?)",
+                    (cfg["key"], cfg["usn"], cfg["mtime_secs"], cfg["val"]),
+                )
+        else:
+            # Fallback: insert minimal required config if source has none
+            import datetime
 
-        # Insert decks
-        for deck in data["decks"]:
-            # Build common protobuf (DeckCommon message)
-            # Field 1: study_collapsed (bool), Field 2: browser_collapsed (bool)
-            # Use 1 (true) to match AnkiDroid's default behavior
-            common = _encode_varint_field(1, 1) + _encode_varint_field(2, 1)
+            try:
+                tz_offset = int(
+                    -datetime.datetime.now().astimezone().utcoffset().total_seconds()
+                    / 60
+                )
+            except Exception:
+                tz_offset = 0
 
-            # Build kind protobuf
-            is_filtered = deck.get("dyn", 0) == 1
-            if is_filtered:
-                kind = _encode_bytes(2, b"")
-            else:
-                conf_id = deck.get("conf", 1)
-                normal_deck = _encode_varint_field(1, conf_id)
-                kind = _encode_bytes(1, normal_deck)
+            default_config = [
+                ("activeDecks", b"[1]"),
+                ("curDeck", b"1"),
+                (
+                    "curModel",
+                    str(first_notetype_id).encode() if first_notetype_id else b"0",
+                ),
+                ("newSpread", b"0"),
+                ("collapseTime", b"1200"),
+                ("timeLim", b"0"),
+                ("estTimes", b"true"),
+                ("dueCounts", b"true"),
+                ("addToCur", b"true"),
+                ("sortType", b'"noteFld"'),
+                ("sortBackwards", b"false"),
+                ("schedVer", b"2"),
+                ("sched2021", b"true"),
+                ("dayLearnFirst", b"false"),
+                ("nextPos", b"1"),
+                ("creationOffset", str(tz_offset).encode()),
+            ]
+            for key, val in default_config:
+                db.execute(
+                    "INSERT OR IGNORE INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
+                    (key, val),
+                )
 
-            db.execute(
-                """INSERT INTO decks (id, name, mtime_secs, usn, common, kind)
-                   VALUES (?, ?, ?, 0, ?, ?)""",
-                (deck["id"], deck["name"], deck.get("mod", 0), common, kind),
-            )
+        # Insert config entries from source collection (preserving original values)
+        if data.get("config"):
+            for cfg in data["config"]:
+                # Skip curModel as we already set it above based on exported notetypes
+                if cfg["key"] == "curModel":
+                    continue
+                db.execute(
+                    "INSERT OR REPLACE INTO config (KEY, usn, mtime_secs, val) VALUES (?, ?, ?, ?)",
+                    (cfg["key"], cfg["usn"], cfg["mtime_secs"], cfg["val"]),
+                )
+        else:
+            # Fallback: insert minimal required config if source has none
+            import datetime
+
+            try:
+                tz_offset = int(
+                    -datetime.datetime.now().astimezone().utcoffset().total_seconds()
+                    / 60
+                )
+            except Exception:
+                tz_offset = 0
+
+            default_config = [
+                ("activeDecks", b"[1]"),
+                ("curDeck", b"1"),
+                ("newSpread", b"0"),
+                ("collapseTime", b"1200"),
+                ("timeLim", b"0"),
+                ("estTimes", b"true"),
+                ("dueCounts", b"true"),
+                ("addToCur", b"true"),
+                ("sortType", b'"noteFld"'),
+                ("sortBackwards", b"false"),
+                ("schedVer", b"2"),
+                ("sched2021", b"true"),
+                ("dayLearnFirst", b"false"),
+                ("nextPos", b"1"),
+                ("creationOffset", str(tz_offset).encode()),
+            ]
+            for key, val in default_config:
+                db.execute(
+                    "INSERT OR IGNORE INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
+                    (key, val),
+                )
+
+        # Insert decks using raw data (preserving common bytes with study statistics)
+        if data.get("decks_raw"):
+            for deck in data["decks_raw"]:
+                db.execute(
+                    """INSERT INTO decks (id, name, mtime_secs, usn, common, kind)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        deck["id"],
+                        deck["name"],
+                        deck["mtime_secs"],
+                        deck["usn"],
+                        deck["common"],
+                        deck["kind"],
+                    ),
+                )
+        else:
+            # Fallback to old method if decks_raw not available
+            for deck in data["decks"]:
+                # Build common protobuf (DeckCommon message)
+                # Field 1: study_collapsed (bool), Field 2: browser_collapsed (bool)
+                # Use 1 (true) to match AnkiDroid's default behavior
+                common = _encode_varint_field(1, 1) + _encode_varint_field(2, 1)
+
+                # Build kind protobuf
+                is_filtered = deck.get("dyn", 0) == 1
+                if is_filtered:
+                    kind = _encode_bytes(2, b"")
+                else:
+                    conf_id = deck.get("conf", 1)
+                    normal_deck = _encode_varint_field(1, conf_id)
+                    kind = _encode_bytes(1, normal_deck)
+
+                db.execute(
+                    """INSERT INTO decks (id, name, mtime_secs, usn, common, kind)
+                       VALUES (?, ?, ?, 0, ?, ?)""",
+                    (deck["id"], deck["name"], deck.get("mod", 0), common, kind),
+                )
 
         # Insert deck configs
         for dconf in data["deck_configs"]:
