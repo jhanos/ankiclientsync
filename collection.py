@@ -902,11 +902,195 @@ class SyncableCollection(CollectionSyncInterface):
         """Public method to count rows in a table."""
         return self._count(table)
 
-    def add_note(self, front: str, back: str, notetype: str = "Basic") -> int:
-        """Add a note with a card. Returns note ID."""
+    def create_deck(self, name: str) -> int:
+        """
+        Create a new deck with the given name.
+
+        Args:
+            name: The deck name. Use "::" for nested decks (e.g., "Parent::Child").
+
+        Returns:
+            The deck ID.
+
+        Raises:
+            ValueError: If a deck with this name already exists.
+        """
+        # Check if deck already exists
+        existing = self.db.execute(
+            "SELECT id FROM decks WHERE name = ?", (name,)
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Deck '{name}' already exists")
+
+        deck_id = int(time.time() * 1000)
+        mtime = int(time.time())
+
+        # Encode common config (field 1 = study_collapsed, field 2 = browser_collapsed)
+        # Default: both set to 1 (true) - same as Anki default
+        common = _encode_varint_field(1, 1) + _encode_varint_field(2, 1)
+
+        # Encode kind - NormalDeck with config_id=1 (default config)
+        # kind is a oneof, field 1 = normal (NormalDeck message)
+        # NormalDeck has field 1 = config_id
+        normal_deck = _encode_varint_field(1, 1)  # config_id = 1
+        kind = _encode_bytes(1, normal_deck)
+
+        # Insert deck with usn=-1 (pending sync)
+        self.db.execute(
+            """INSERT INTO decks (id, name, mtime_secs, usn, common, kind)
+               VALUES (?, ?, ?, -1, ?, ?)""",
+            (deck_id, name, mtime, common, kind),
+        )
+
+        # Update collection modification time
+        self.db.execute("UPDATE col SET mod = ? WHERE id = 1", (mtime * 1000,))
+        self.db.commit()
+
+        return deck_id
+
+    def get_deck_id(self, name: str) -> Optional[int]:
+        """
+        Get the ID of a deck by name.
+
+        Args:
+            name: The deck name.
+
+        Returns:
+            The deck ID, or None if not found.
+        """
+        row = self.db.execute("SELECT id FROM decks WHERE name = ?", (name,)).fetchone()
+        return row[0] if row else None
+
+    def add_media(self, source_path: str | Path, filename: Optional[str] = None) -> str:
+        """
+        Add a media file to the collection's media folder.
+
+        The file is copied to the media folder and can then be referenced
+        in notes using HTML tags like <img src="filename">.
+
+        Args:
+            source_path: Path to the source file to add.
+            filename: Optional filename to use in the media folder.
+                      If None, uses the original filename.
+
+        Returns:
+            The filename as stored in the media folder (use this in notes).
+
+        Raises:
+            FileNotFoundError: If the source file doesn't exist.
+            ValueError: If the media folder doesn't exist and can't be created.
+        """
+        source = Path(source_path)
+        if not source.exists():
+            raise FileNotFoundError(f"Source file not found: {source}")
+
+        # Use provided filename or original
+        if filename is None:
+            filename = source.name
+
+        # Ensure media folder exists
+        self.media_folder.mkdir(parents=True, exist_ok=True)
+
+        # Copy file to media folder
+        dest = self.media_folder / filename
+        shutil.copy(source, dest)
+
+        return filename
+
+    def media_ref(self, filename: str, tag: str = "img") -> str:
+        """
+        Generate an HTML reference to a media file.
+
+        Args:
+            filename: The media filename (as returned by add_media).
+            tag: The HTML tag type - "img" for images, "audio" for sound files.
+
+        Returns:
+            HTML string to embed in note fields.
+
+        Examples:
+            >>> col.media_ref("image.png")
+            '<img src="image.png">'
+            >>> col.media_ref("sound.mp3", tag="audio")
+            '[sound:sound.mp3]'
+        """
+        if tag == "img":
+            return f'<img src="{filename}">'
+        elif tag == "audio" or tag == "sound":
+            return f"[sound:{filename}]"
+        else:
+            return f'<{tag} src="{filename}"></{tag}>'
+
+    def add_note(
+        self,
+        front: str,
+        back: str,
+        deck: Optional[str | int] = None,
+        notetype: str = "Basic",
+        front_image: Optional[str | Path] = None,
+        back_image: Optional[str | Path] = None,
+    ) -> int:
+        """
+        Add a note with a card to the collection.
+
+        Args:
+            front: The front field content.
+            back: The back field content.
+            deck: The deck name or ID. If None, uses the Default deck (id=1).
+            notetype: The notetype name (default: "Basic").
+            front_image: Optional path to an image file to add to the front field.
+            back_image: Optional path to an image file to add to the back field.
+
+        Returns:
+            The note ID.
+
+        Raises:
+            ValueError: If the notetype or deck is not found.
+            FileNotFoundError: If an image file doesn't exist.
+
+        Examples:
+            # Simple text note
+            col.add_note("What is 2+2?", "4")
+
+            # Note with image on front
+            col.add_note("What animal is this?", "A cat", front_image="/path/to/cat.jpg")
+
+            # Note with images on both sides
+            col.add_note("Front", "Back", front_image="q.png", back_image="a.png")
+
+            # For more control, use add_media() and media_ref() directly:
+            fname = col.add_media("/path/to/image.png")
+            col.add_note(f"Question {col.media_ref(fname)}", "Answer")
+        """
         import random
         import string
         import zlib
+
+        # Process images if provided
+        front_content = front
+        back_content = back
+
+        if front_image:
+            img_filename = self.add_media(front_image)
+            front_content = f"{front}<br>{self.media_ref(img_filename)}"
+
+        if back_image:
+            img_filename = self.add_media(back_image)
+            back_content = f"{back}<br>{self.media_ref(img_filename)}"
+
+        # Resolve deck ID
+        if deck is None:
+            deck_id = 1  # Default deck
+        elif isinstance(deck, int):
+            deck_id = deck
+        else:
+            # Look up deck by name
+            row = self.db.execute(
+                "SELECT id FROM decks WHERE name = ?", (deck,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Deck '{deck}' not found")
+            deck_id = row[0]
 
         note_id = int(time.time() * 1000)
         mod = int(time.time())
@@ -920,8 +1104,9 @@ class SyncableCollection(CollectionSyncInterface):
             raise ValueError(f"Notetype '{notetype}' not found")
         mid = row[0]
 
+        # Use original front for sort field and checksum
         csum = zlib.crc32(front.encode()) & 0xFFFFFFFF
-        flds = f"{front}\x1f{back}"
+        flds = f"{front_content}\x1f{back_content}"
 
         # Insert note with usn=-1 (pending sync)
         self.db.execute(
@@ -935,8 +1120,8 @@ class SyncableCollection(CollectionSyncInterface):
         self.db.execute(
             """INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl,
                                   factor, reps, lapses, left, odue, odid, flags, data)
-               VALUES (?, ?, 1, 0, ?, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')""",
-            (card_id, note_id, mod),
+               VALUES (?, ?, ?, 0, ?, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')""",
+            (card_id, note_id, deck_id, mod),
         )
 
         # Update collection modification time
@@ -944,1269 +1129,3 @@ class SyncableCollection(CollectionSyncInterface):
         self.db.commit()
 
         return note_id
-
-    # -------------------------------------------------------------------------
-    # Export Functions
-    # -------------------------------------------------------------------------
-
-    def export_anki_package(
-        self,
-        out_path: str | Path,
-        deck_id: Optional[int] = None,
-        with_scheduling: bool = True,
-        with_media: bool = False,
-        legacy: bool = False,
-    ) -> int:
-        """
-        Export collection or deck to an .apkg file.
-
-        Args:
-            out_path: Path to output .apkg file
-            deck_id: If provided, only export this deck. Otherwise export all.
-            with_scheduling: Include review history and scheduling info
-            with_media: Include media files from the media folder
-            legacy: Use legacy format for older Anki clients
-
-        Returns:
-            Number of notes exported
-        """
-        import zipfile
-        import re
-
-        out_path = Path(out_path)
-
-        # Gather data to export
-        data = self._gather_export_data(deck_id, with_scheduling)
-
-        # Create a temporary collection with only the exported data
-        temp_col_bytes = self._create_export_collection(data, with_scheduling, legacy)
-
-        # Find media files referenced in notes
-        media_files = {}  # index -> filename
-        if with_media and self.media_folder.exists():
-            # Regex to find media references: [sound:file.mp3] or <img src="file.jpg">
-            media_pattern = re.compile(
-                r'\[sound:([^\]]+)\]|<img[^>]+src=["\']([^"\']+)["\']'
-            )
-
-            referenced = set()
-            for note in data["notes"]:
-                flds = note.get("flds", "")
-                if isinstance(flds, str):
-                    for match in media_pattern.finditer(flds):
-                        fname = match.group(1) or match.group(2)
-                        if fname:
-                            referenced.add(fname)
-
-            # Check which files exist
-            idx = 0
-            for fname in sorted(referenced):
-                fpath = self.media_folder / fname
-                if fpath.exists() and fpath.is_file():
-                    media_files[str(idx)] = fname
-                    idx += 1
-
-        # Build the .apkg ZIP archive
-        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as zf:
-            # Write meta file (protobuf encoded)
-            meta_bytes = self._encode_package_meta(legacy)
-            zf.writestr("meta", meta_bytes)
-
-            # Write collection file
-            col_filename = "collection.anki21" if legacy else "collection.anki21b"
-            if legacy:
-                zf.writestr(col_filename, temp_col_bytes)
-            else:
-                # Compress with zstd for latest format
-                import zstandard as zstd
-
-                compressor = zstd.ZstdCompressor()
-                compressed = compressor.compress(temp_col_bytes)
-                zf.writestr(col_filename, compressed)
-
-            # Write legacy dummy collection for older clients
-            if not legacy:
-                dummy_col = self._create_dummy_collection()
-                zf.writestr("collection.anki2", dummy_col)
-
-            # Write media files and index
-            if with_media and media_files:
-                if legacy:
-                    # Legacy format: JSON map of index -> filename
-                    zf.writestr("media", json.dumps(media_files).encode())
-                else:
-                    # Modern format: protobuf MediaEntries
-                    # Field 1 = repeated MediaEntry { field 1 = name, field 2 = size, ... }
-                    media_entries = b""
-                    for idx_str, fname in media_files.items():
-                        # MediaEntry: field 1 = name (string), field 2 = size (varint), field 5 = legacy_zip_filename (varint)
-                        entry = _encode_string(1, fname)
-                        fpath = self.media_folder / fname
-                        entry += _encode_varint_field(2, fpath.stat().st_size)
-                        entry += _encode_varint_field(5, int(idx_str))
-                        media_entries += _encode_bytes(1, entry)
-                    zf.writestr("media", media_entries)
-
-                # Add actual media files
-                for idx_str, fname in media_files.items():
-                    fpath = self.media_folder / fname
-                    zf.write(fpath, idx_str)
-            else:
-                # Empty media
-                if legacy:
-                    zf.writestr("media", b"{}")
-                else:
-                    zf.writestr("media", b"")
-
-        return len(data["notes"])
-
-    def _gather_export_data(
-        self, deck_id: Optional[int], with_scheduling: bool
-    ) -> dict:
-        """Gather all data needed for export."""
-        data = {
-            "notes": [],
-            "cards": [],
-            "decks": [],
-            "notetypes": [],
-            "revlog": [],
-            "deck_configs": [],
-        }
-
-        # Get deck IDs to export
-        if deck_id:
-            # Get the deck and its children
-            deck_ids = self._get_deck_and_children_ids(deck_id)
-        else:
-            # All decks
-            deck_ids = [row["id"] for row in self.db.execute("SELECT id FROM decks")]
-
-        # Get cards in those decks
-        if deck_ids:
-            placeholders = ",".join("?" * len(deck_ids))
-            card_rows = self.db.execute(
-                f"SELECT * FROM cards WHERE did IN ({placeholders})", deck_ids
-            ).fetchall()
-        else:
-            card_rows = []
-
-        for row in card_rows:
-            data["cards"].append(dict(row))
-
-        # Get notes for those cards
-        note_ids = list(set(card["nid"] for card in data["cards"]))
-        if note_ids:
-            placeholders = ",".join("?" * len(note_ids))
-            note_rows = self.db.execute(
-                f"SELECT * FROM notes WHERE id IN ({placeholders})", note_ids
-            ).fetchall()
-            for row in note_rows:
-                data["notes"].append(dict(row))
-
-        # Get notetypes used by those notes
-        notetype_ids = list(set(note["mid"] for note in data["notes"]))
-        if notetype_ids:
-            placeholders = ",".join("?" * len(notetype_ids))
-            for row in self.db.execute(
-                f"SELECT * FROM notetypes WHERE id IN ({placeholders})", notetype_ids
-            ):
-                nt_dict = self._get_notetype_dict(row["id"])
-                if nt_dict:
-                    data["notetypes"].append(nt_dict)
-
-        # Get decks
-        for did in deck_ids:
-            deck_dict = self._get_deck_dict(did)
-            if deck_dict:
-                data["decks"].append(deck_dict)
-
-        # Get deck configs
-        config_ids = list(set(d.get("conf", 1) for d in data["decks"]))
-        if config_ids:
-            placeholders = ",".join("?" * len(config_ids))
-            for row in self.db.execute(
-                f"SELECT * FROM deck_config WHERE id IN ({placeholders})", config_ids
-            ):
-                dconf_dict = self._get_deck_config_dict(row["id"])
-                if dconf_dict:
-                    data["deck_configs"].append(dconf_dict)
-
-        # Get revlog if scheduling is included
-        if with_scheduling:
-            card_ids = [c["id"] for c in data["cards"]]
-            if card_ids:
-                placeholders = ",".join("?" * len(card_ids))
-                for row in self.db.execute(
-                    f"SELECT * FROM revlog WHERE cid IN ({placeholders})", card_ids
-                ):
-                    data["revlog"].append(dict(row))
-
-        # Get config entries from source collection
-        data["config"] = []
-        try:
-            for row in self.db.execute("SELECT key, usn, mtime_secs, val FROM config"):
-                data["config"].append(
-                    {
-                        "key": row["key"],
-                        "usn": row["usn"],
-                        "mtime_secs": row["mtime_secs"],
-                        "val": row["val"],
-                    }
-                )
-        except Exception:
-            pass  # Config table may not exist in older collections
-
-        # Get raw deck data (preserving common bytes for study statistics)
-        data["decks_raw"] = []
-        for did in deck_ids:
-            row = self.db.execute(
-                "SELECT id, name, mtime_secs, usn, common, kind FROM decks WHERE id = ?",
-                (did,),
-            ).fetchone()
-            if row:
-                data["decks_raw"].append(
-                    {
-                        "id": row["id"],
-                        "name": row["name"],
-                        "mtime_secs": row["mtime_secs"],
-                        "usn": row["usn"],
-                        "common": row["common"],
-                        "kind": row["kind"],
-                    }
-                )
-
-        return data
-
-    def _get_deck_and_children_ids(self, deck_id: int) -> list[int]:
-        """Get a deck and all its children's IDs."""
-        # Get the deck name
-        row = self.db.execute(
-            "SELECT name FROM decks WHERE id = ?", (deck_id,)
-        ).fetchone()
-        if not row:
-            return []
-
-        deck_name = row["name"]
-        deck_ids = [deck_id]
-
-        # Find all child decks (name starts with "parent::")
-        prefix = deck_name + "::"
-        for row in self.db.execute("SELECT id, name FROM decks"):
-            if row["name"].startswith(prefix):
-                deck_ids.append(row["id"])
-
-        return deck_ids
-
-    def _create_export_collection(
-        self, data: dict, with_scheduling: bool, legacy: bool
-    ) -> bytes:
-        """Create a minimal collection database with only the exported data."""
-        import tempfile
-
-        # Create temp file for the collection
-        with tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as f:
-            temp_path = Path(f.name)
-
-        try:
-            # Create the schema
-            self._create_collection_schema(temp_path, legacy)
-
-            # Connect and insert data
-            temp_db = _connect_db(temp_path)
-            try:
-                self._insert_export_data(temp_db, data, with_scheduling, legacy)
-                temp_db.commit()
-                # Run ANALYZE to create sqlite_stat1 and sqlite_stat4 tables
-                # STAT4 requires enabling it first (SQLite compile-time option or pragma)
-                try:
-                    temp_db.execute("PRAGMA analysis_limit=1000")
-                except Exception:
-                    pass
-                temp_db.execute("ANALYZE")
-                temp_db.commit()
-            finally:
-                temp_db.close()
-
-            # Read the file contents
-            return temp_path.read_bytes()
-        finally:
-            temp_path.unlink(missing_ok=True)
-
-    def _create_collection_schema(self, path: Path, legacy: bool) -> None:
-        """Create the Anki collection database schema."""
-        import sqlite3
-
-        db = sqlite3.connect(str(path))
-        db.create_collation("unicase", _unicase)
-        db.executescript("""
-            -- Collection metadata
-            CREATE TABLE col (
-                id INTEGER PRIMARY KEY,
-                crt INTEGER NOT NULL,
-                mod INTEGER NOT NULL,
-                scm INTEGER NOT NULL,
-                ver INTEGER NOT NULL,
-                dty INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                ls INTEGER NOT NULL,
-                conf TEXT NOT NULL,
-                models TEXT NOT NULL,
-                decks TEXT NOT NULL,
-                dconf TEXT NOT NULL,
-                tags TEXT NOT NULL
-            );
-
-            -- Notes
-            CREATE TABLE notes (
-                id INTEGER PRIMARY KEY,
-                guid TEXT NOT NULL,
-                mid INTEGER NOT NULL,
-                mod INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                tags TEXT NOT NULL,
-                flds TEXT NOT NULL,
-                sfld TEXT NOT NULL,
-                csum INTEGER NOT NULL,
-                flags INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-
-            -- Cards
-            CREATE TABLE cards (
-                id INTEGER PRIMARY KEY,
-                nid INTEGER NOT NULL,
-                did INTEGER NOT NULL,
-                ord INTEGER NOT NULL,
-                mod INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                type INTEGER NOT NULL,
-                queue INTEGER NOT NULL,
-                due INTEGER NOT NULL,
-                ivl INTEGER NOT NULL,
-                factor INTEGER NOT NULL,
-                reps INTEGER NOT NULL,
-                lapses INTEGER NOT NULL,
-                left INTEGER NOT NULL,
-                odue INTEGER NOT NULL,
-                odid INTEGER NOT NULL,
-                flags INTEGER NOT NULL,
-                data TEXT NOT NULL
-            );
-
-            -- Review log
-            CREATE TABLE revlog (
-                id INTEGER PRIMARY KEY,
-                cid INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                ease INTEGER NOT NULL,
-                ivl INTEGER NOT NULL,
-                lastIvl INTEGER NOT NULL,
-                factor INTEGER NOT NULL,
-                time INTEGER NOT NULL,
-                type INTEGER NOT NULL
-            );
-
-            -- Graves
-            CREATE TABLE graves (
-                usn INTEGER NOT NULL,
-                oid INTEGER NOT NULL,
-                type INTEGER NOT NULL
-            );
-
-            -- Notetypes (modern schema)
-            CREATE TABLE notetypes (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL COLLATE unicase,
-                mtime_secs INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                config BLOB NOT NULL
-            );
-
-            -- Fields
-            CREATE TABLE fields (
-                ntid INTEGER NOT NULL,
-                ord INTEGER NOT NULL,
-                name TEXT NOT NULL COLLATE unicase,
-                config BLOB NOT NULL,
-                PRIMARY KEY (ntid, ord)
-            );
-
-            -- Templates
-            CREATE TABLE templates (
-                ntid INTEGER NOT NULL,
-                ord INTEGER NOT NULL,
-                name TEXT NOT NULL COLLATE unicase,
-                mtime_secs INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                config BLOB NOT NULL,
-                PRIMARY KEY (ntid, ord)
-            );
-
-            -- Decks (modern schema)
-            CREATE TABLE decks (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL COLLATE unicase,
-                mtime_secs INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                common BLOB NOT NULL,
-                kind BLOB NOT NULL
-            );
-
-            -- Deck config
-            CREATE TABLE deck_config (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL COLLATE unicase,
-                mtime_secs INTEGER NOT NULL,
-                usn INTEGER NOT NULL,
-                config BLOB NOT NULL
-            );
-
-            -- Tags
-            CREATE TABLE tags (
-                tag TEXT PRIMARY KEY NOT NULL COLLATE unicase,
-                usn INTEGER NOT NULL
-            );
-
-            -- Config (modern schema - required by AnkiDroid)
-            CREATE TABLE config (
-                KEY TEXT NOT NULL PRIMARY KEY,
-                usn INTEGER NOT NULL,
-                mtime_secs INTEGER NOT NULL,
-                val BLOB NOT NULL
-            ) WITHOUT ROWID;
-
-            -- Indexes
-            CREATE INDEX idx_notes_mid ON notes (mid);
-            CREATE INDEX ix_notes_usn ON notes (usn);
-            CREATE INDEX ix_notes_csum ON notes (csum);
-            CREATE INDEX ix_cards_nid ON cards (nid);
-            CREATE INDEX ix_cards_sched ON cards (did, queue, due);
-            CREATE INDEX ix_cards_usn ON cards (usn);
-            CREATE INDEX idx_cards_odid ON cards (odid) WHERE odid != 0;
-            CREATE INDEX ix_revlog_cid ON revlog (cid);
-            CREATE INDEX ix_revlog_usn ON revlog (usn);
-            CREATE INDEX idx_decks_name ON decks (name);
-            CREATE INDEX idx_notetypes_name ON notetypes (name);
-            CREATE INDEX idx_notetypes_usn ON notetypes (usn);
-            CREATE INDEX idx_fields_name_ntid ON fields (name, ntid);
-            CREATE INDEX idx_templates_name_ntid ON templates (name, ntid);
-            CREATE INDEX idx_templates_usn ON templates (usn);
-            CREATE INDEX idx_graves_pending ON graves (usn);
-        """)
-
-        # Get creation time from source collection
-        crt = self.db.execute("SELECT crt FROM col WHERE id = 1").fetchone()
-        crt = crt[0] if crt else int(time.time())
-
-        # Insert col row - use empty strings for modern schema
-        mod = int(time.time() * 1000)
-        scm = mod
-        ver = 11 if legacy else 18
-        db.execute(
-            """INSERT INTO col (id, crt, mod, scm, ver, dty, usn, ls, conf, models, decks, dconf, tags)
-               VALUES (1, ?, ?, ?, ?, 0, 0, 0, '', '', '', '', '')""",
-            (crt, mod, scm, ver),
-        )
-
-        # Note: Config entries are now inserted in _insert_export_data to preserve source values
-
-        db.commit()
-        db.close()
-
-    def _insert_export_data(
-        self, db: sqlite3.Connection, data: dict, with_scheduling: bool, legacy: bool
-    ) -> None:
-        """Insert gathered data into the export collection."""
-        # Insert notes
-        for note in data["notes"]:
-            if with_scheduling:
-                db.execute(
-                    """INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data)
-                       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        note["id"],
-                        note["guid"],
-                        note["mid"],
-                        note["mod"],
-                        note["tags"],
-                        note["flds"],
-                        note["sfld"],
-                        note["csum"],
-                        note["flags"],
-                        note["data"],
-                    ),
-                )
-            else:
-                # Reset USN and strip system tags
-                tags = note["tags"]
-                # Remove system tags (marked, leech)
-                tag_list = [
-                    t for t in tags.split() if t.lower() not in ("marked", "leech")
-                ]
-                db.execute(
-                    """INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data)
-                       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 0, '')""",
-                    (
-                        note["id"],
-                        note["guid"],
-                        note["mid"],
-                        note["mod"],
-                        " ".join(tag_list),
-                        note["flds"],
-                        note["sfld"],
-                        note["csum"],
-                    ),
-                )
-
-        # Insert cards
-        for card in data["cards"]:
-            if with_scheduling:
-                db.execute(
-                    """INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl,
-                                          factor, reps, lapses, left, odue, odid, flags, data)
-                       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        card["id"],
-                        card["nid"],
-                        card["did"],
-                        card["ord"],
-                        card["mod"],
-                        card["type"],
-                        card["queue"],
-                        card["due"],
-                        card["ivl"],
-                        card["factor"],
-                        card["reps"],
-                        card["lapses"],
-                        card["left"],
-                        card["odue"],
-                        card["odid"],
-                        card["flags"],
-                        card["data"],
-                    ),
-                )
-            else:
-                # Reset card to new state
-                db.execute(
-                    """INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl,
-                                          factor, reps, lapses, left, odue, odid, flags, data)
-                       VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')""",
-                    (
-                        card["id"],
-                        card["nid"],
-                        card["did"],
-                        card["ord"],
-                        card["mod"],
-                    ),
-                )
-
-        # Insert revlog if scheduling
-        if with_scheduling:
-            for rev in data["revlog"]:
-                db.execute(
-                    """INSERT INTO revlog (id, cid, usn, ease, ivl, lastIvl, factor, time, type)
-                       VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        rev["id"],
-                        rev["cid"],
-                        rev["ease"],
-                        rev["ivl"],
-                        rev["lastIvl"],
-                        rev["factor"],
-                        rev["time"],
-                        rev["type"],
-                    ),
-                )
-
-        # Insert notetypes
-        first_notetype_id = None
-        for nt in data["notetypes"]:
-            if first_notetype_id is None:
-                first_notetype_id = nt["id"]
-
-            # Build config protobuf with all required fields
-            nt_config = b""
-            # Field 3 = CSS
-            if css := nt.get("css", ""):
-                nt_config += _encode_string(3, css)
-
-            # Field 5 (0x2a) = LaTeX configuration (required by AnkiDroid)
-            # Default LaTeX preamble
-            latex_pre = r"""\documentclass[12pt]{article}
-\special{papersize=3in,5in}
-\usepackage[utf8]{inputenc}
-\usepackage{amssymb,amsmath}
-\pagestyle{empty}
-\setlength{\parindent}{0in}
-\begin{document}
-"""
-            latex_post = r"\end{document}"
-            nt_config += _encode_string(5, latex_pre)
-            # Field 6 = LaTeX post
-            nt_config += _encode_string(6, latex_post)
-
-            # Field 8 (0x42) = additional config bytes
-            # Field 9 (0x48) = type (0 = standard, 1 = cloze)
-            nt_config += _encode_varint_field(9, nt.get("type", 0))
-
-            db.execute(
-                """INSERT INTO notetypes (id, name, mtime_secs, usn, config)
-                   VALUES (?, ?, ?, 0, ?)""",
-                (nt["id"], nt["name"], nt.get("mod", 0), nt_config),
-            )
-
-            # Insert fields
-            for fld in nt.get("flds", []):
-                fld_config = b""
-                if font := fld.get("font", "Arial"):
-                    fld_config += _encode_string(3, font)
-                if size := fld.get("size", 20):
-                    fld_config += _encode_varint_field(4, size)
-
-                db.execute(
-                    "INSERT INTO fields (ntid, ord, name, config) VALUES (?, ?, ?, ?)",
-                    (nt["id"], fld.get("ord", 0), fld["name"], fld_config),
-                )
-
-            # Insert templates
-            for tmpl in nt.get("tmpls", []):
-                tmpl_config = b""
-                if qfmt := tmpl.get("qfmt", ""):
-                    tmpl_config += _encode_string(1, qfmt)
-                if afmt := tmpl.get("afmt", ""):
-                    tmpl_config += _encode_string(2, afmt)
-
-                db.execute(
-                    """INSERT INTO templates (ntid, ord, name, mtime_secs, usn, config)
-                       VALUES (?, ?, ?, 0, 0, ?)""",
-                    (nt["id"], tmpl.get("ord", 0), tmpl["name"], tmpl_config),
-                )
-
-        # Insert config entries from source collection (preserving original values)
-        if data.get("config"):
-            for cfg in data["config"]:
-                db.execute(
-                    "INSERT OR REPLACE INTO config (KEY, usn, mtime_secs, val) VALUES (?, ?, ?, ?)",
-                    (cfg["key"], cfg["usn"], cfg["mtime_secs"], cfg["val"]),
-                )
-        else:
-            # Fallback: insert minimal required config if source has none
-            import datetime
-
-            try:
-                tz_offset = int(
-                    -datetime.datetime.now().astimezone().utcoffset().total_seconds()
-                    / 60
-                )
-            except Exception:
-                tz_offset = 0
-
-            default_config = [
-                ("activeDecks", b"[1]"),
-                ("curDeck", b"1"),
-                (
-                    "curModel",
-                    str(first_notetype_id).encode() if first_notetype_id else b"0",
-                ),
-                ("newSpread", b"0"),
-                ("collapseTime", b"1200"),
-                ("timeLim", b"0"),
-                ("estTimes", b"true"),
-                ("dueCounts", b"true"),
-                ("addToCur", b"true"),
-                ("sortType", b'"noteFld"'),
-                ("sortBackwards", b"false"),
-                ("schedVer", b"2"),
-                ("sched2021", b"true"),
-                ("dayLearnFirst", b"false"),
-                ("nextPos", b"1"),
-                ("creationOffset", str(tz_offset).encode()),
-            ]
-            for key, val in default_config:
-                db.execute(
-                    "INSERT OR IGNORE INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
-                    (key, val),
-                )
-
-        # Insert config entries from source collection (preserving original values)
-        if data.get("config"):
-            for cfg in data["config"]:
-                # Skip curModel as we already set it above based on exported notetypes
-                if cfg["key"] == "curModel":
-                    continue
-                db.execute(
-                    "INSERT OR REPLACE INTO config (KEY, usn, mtime_secs, val) VALUES (?, ?, ?, ?)",
-                    (cfg["key"], cfg["usn"], cfg["mtime_secs"], cfg["val"]),
-                )
-        else:
-            # Fallback: insert minimal required config if source has none
-            import datetime
-
-            try:
-                tz_offset = int(
-                    -datetime.datetime.now().astimezone().utcoffset().total_seconds()
-                    / 60
-                )
-            except Exception:
-                tz_offset = 0
-
-            default_config = [
-                ("activeDecks", b"[1]"),
-                ("curDeck", b"1"),
-                ("newSpread", b"0"),
-                ("collapseTime", b"1200"),
-                ("timeLim", b"0"),
-                ("estTimes", b"true"),
-                ("dueCounts", b"true"),
-                ("addToCur", b"true"),
-                ("sortType", b'"noteFld"'),
-                ("sortBackwards", b"false"),
-                ("schedVer", b"2"),
-                ("sched2021", b"true"),
-                ("dayLearnFirst", b"false"),
-                ("nextPos", b"1"),
-                ("creationOffset", str(tz_offset).encode()),
-            ]
-            for key, val in default_config:
-                db.execute(
-                    "INSERT OR IGNORE INTO config (KEY, usn, mtime_secs, val) VALUES (?, 0, 0, ?)",
-                    (key, val),
-                )
-
-        # Insert decks using raw data (preserving common bytes with study statistics)
-        if data.get("decks_raw"):
-            for deck in data["decks_raw"]:
-                db.execute(
-                    """INSERT INTO decks (id, name, mtime_secs, usn, common, kind)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        deck["id"],
-                        deck["name"],
-                        deck["mtime_secs"],
-                        deck["usn"],
-                        deck["common"],
-                        deck["kind"],
-                    ),
-                )
-        else:
-            # Fallback to old method if decks_raw not available
-            for deck in data["decks"]:
-                # Build common protobuf (DeckCommon message)
-                # Field 1: study_collapsed (bool), Field 2: browser_collapsed (bool)
-                # Use 1 (true) to match AnkiDroid's default behavior
-                common = _encode_varint_field(1, 1) + _encode_varint_field(2, 1)
-
-                # Build kind protobuf
-                is_filtered = deck.get("dyn", 0) == 1
-                if is_filtered:
-                    kind = _encode_bytes(2, b"")
-                else:
-                    conf_id = deck.get("conf", 1)
-                    normal_deck = _encode_varint_field(1, conf_id)
-                    kind = _encode_bytes(1, normal_deck)
-
-                db.execute(
-                    """INSERT INTO decks (id, name, mtime_secs, usn, common, kind)
-                       VALUES (?, ?, ?, 0, ?, ?)""",
-                    (deck["id"], deck["name"], deck.get("mod", 0), common, kind),
-                )
-
-        # Insert deck configs
-        for dconf in data["deck_configs"]:
-            # Empty config protobuf - Anki will use defaults
-            db.execute(
-                """INSERT INTO deck_config (id, name, mtime_secs, usn, config)
-                   VALUES (?, ?, ?, 0, ?)""",
-                (dconf["id"], dconf["name"], dconf.get("mod", 0), b""),
-            )
-
-    def _encode_package_meta(self, legacy: bool) -> bytes:
-        """Encode package metadata as protobuf."""
-        # PackageMetadata message: field 1 = version (varint)
-        # Version: Legacy1=1, Legacy2=2, Latest=3
-        version = 2 if legacy else 3
-        return _encode_varint_field(1, version)
-
-    def _create_dummy_collection(self) -> bytes:
-        """Create a dummy collection for older Anki clients."""
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as f:
-            temp_path = Path(f.name)
-
-        try:
-            import sqlite3
-
-            db = sqlite3.connect(str(temp_path))
-            db.executescript("""
-                CREATE TABLE col (
-                    id INTEGER PRIMARY KEY, crt INTEGER, mod INTEGER, scm INTEGER,
-                    ver INTEGER, dty INTEGER, usn INTEGER, ls INTEGER,
-                    conf TEXT, models TEXT, decks TEXT, dconf TEXT, tags TEXT
-                );
-                CREATE TABLE notes (
-                    id INTEGER PRIMARY KEY, guid TEXT, mid INTEGER, mod INTEGER,
-                    usn INTEGER, tags TEXT, flds TEXT, sfld TEXT, csum INTEGER,
-                    flags INTEGER, data TEXT
-                );
-                CREATE TABLE cards (
-                    id INTEGER PRIMARY KEY, nid INTEGER, did INTEGER, ord INTEGER,
-                    mod INTEGER, usn INTEGER, type INTEGER, queue INTEGER,
-                    due INTEGER, ivl INTEGER, factor INTEGER, reps INTEGER,
-                    lapses INTEGER, left INTEGER, odue INTEGER, odid INTEGER,
-                    flags INTEGER, data TEXT
-                );
-                CREATE TABLE revlog (
-                    id INTEGER PRIMARY KEY, cid INTEGER, usn INTEGER, ease INTEGER,
-                    ivl INTEGER, lastIvl INTEGER, factor INTEGER, time INTEGER,
-                    type INTEGER
-                );
-                CREATE TABLE graves (usn INTEGER, oid INTEGER, type INTEGER);
-            """)
-
-            crt = int(time.time())
-            mod = crt * 1000
-
-            # Minimal notetype for the dummy note
-            basic_model = {
-                "1": {
-                    "id": 1,
-                    "name": "Basic",
-                    "type": 0,
-                    "mod": 0,
-                    "usn": 0,
-                    "flds": [
-                        {"name": "Front", "ord": 0, "font": "Arial", "size": 20},
-                        {"name": "Back", "ord": 1, "font": "Arial", "size": 20},
-                    ],
-                    "tmpls": [
-                        {
-                            "name": "Card 1",
-                            "ord": 0,
-                            "qfmt": "{{Front}}",
-                            "afmt": "{{FrontSide}}<hr id=answer>{{Back}}",
-                        }
-                    ],
-                    "css": ".card { font-family: arial; }",
-                }
-            }
-
-            default_deck = {"1": {"id": 1, "name": "Default", "mod": 0, "usn": 0}}
-
-            db.execute(
-                """INSERT INTO col VALUES (1, ?, ?, ?, 11, 0, 0, 0, '{}', ?, ?, '{}', '{}')""",
-                (crt, mod, mod, json.dumps(basic_model), json.dumps(default_deck)),
-            )
-
-            # Add dummy note explaining the package is too new
-            db.execute(
-                """INSERT INTO notes VALUES (1, 'dummy', 1, ?, 0, '',
-                   'This Anki package was created with a newer version of Anki.\x1fPlease update Anki to import this package.',
-                   'This Anki package was created with a newer version of Anki.', 0, 0, '')""",
-                (crt,),
-            )
-            db.execute(
-                """INSERT INTO cards VALUES (1, 1, 1, 0, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '')""",
-                (crt,),
-            )
-
-            db.execute("PRAGMA page_size=512")
-            db.commit()
-            db.execute("VACUUM")
-            db.close()
-
-            return temp_path.read_bytes()
-        finally:
-            temp_path.unlink(missing_ok=True)
-
-    # -------------------------------------------------------------------------
-    # Import Functions
-    # -------------------------------------------------------------------------
-
-    @classmethod
-    def from_apkg(
-        cls,
-        apkg_path: str | Path,
-        output_dir: str | Path,
-        extract_media: bool = True,
-    ) -> "SyncableCollection":
-        """
-        Create a new SyncableCollection by importing an .apkg file.
-
-        Args:
-            apkg_path: Path to the .apkg file to import
-            output_dir: Directory to extract the collection to
-            extract_media: Whether to extract media files
-
-        Returns:
-            A new SyncableCollection instance
-
-        Example:
-            col = SyncableCollection.from_apkg("/path/to/deck.apkg", "/path/to/output/")
-            client = SyncClient(col, auth)
-            client.full_upload()
-        """
-        import zipfile
-
-        apkg_path = Path(apkg_path)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        col_path = output_dir / "collection.anki2"
-        media_folder = output_dir / "collection.media"
-
-        with zipfile.ZipFile(apkg_path, "r") as zf:
-            files = zf.namelist()
-
-            # Determine package format and extract collection
-            if "collection.anki21b" in files:
-                # Modern format (zstd compressed)
-                import zstandard as zstd
-                import io
-
-                compressed = zf.read("collection.anki21b")
-                # Use streaming decompression to handle files without content size
-                dctx = zstd.ZstdDecompressor()
-                with dctx.stream_reader(io.BytesIO(compressed)) as reader:
-                    decompressed = reader.read()
-                col_path.write_bytes(decompressed)
-            elif "collection.anki21" in files:
-                # Legacy format (uncompressed)
-                col_path.write_bytes(zf.read("collection.anki21"))
-            elif "collection.anki2" in files:
-                # Very old format
-                col_path.write_bytes(zf.read("collection.anki2"))
-            else:
-                raise ValueError("No collection file found in .apkg")
-
-            # Extract media files
-            if extract_media and "media" in files:
-                media_folder.mkdir(exist_ok=True)
-                media_data = zf.read("media")
-
-                if media_data:
-                    # Check if media data is zstd-compressed (magic bytes: 28 b5 2f fd)
-                    if media_data[:4] == b"\x28\xb5\x2f\xfd":
-                        import zstandard as zstd
-                        import io
-
-                        dctx = zstd.ZstdDecompressor()
-                        # Use streaming decompression to handle files without content size
-                        with dctx.stream_reader(io.BytesIO(media_data)) as reader:
-                            media_data = reader.read()
-
-                    # Try to parse as JSON (legacy format)
-                    try:
-                        media_map = json.loads(media_data)
-                        # Legacy format: {"0": "image.jpg", "1": "audio.mp3", ...}
-                        for idx, fname in media_map.items():
-                            if idx in files:
-                                (media_folder / fname).write_bytes(zf.read(idx))
-                    except json.JSONDecodeError:
-                        # Modern format: protobuf MediaEntries
-                        media_map = cls._parse_media_entries(media_data)
-                        for idx, fname in media_map.items():
-                            if idx in files:
-                                (media_folder / fname).write_bytes(zf.read(idx))
-
-        return cls(col_path, media_folder=media_folder)
-
-    @staticmethod
-    def _parse_media_entries(data: bytes) -> dict[str, str]:
-        """
-        Parse protobuf MediaEntries to get index -> filename mapping.
-
-        MediaEntries { repeated MediaEntry entries = 1 }
-        MediaEntry { string name = 1, uint64 size = 2, ..., uint32 legacy_zip_filename = 5 }
-        """
-        result = {}
-        pos = 0
-
-        while pos < len(data):
-            # Read tag
-            if pos >= len(data):
-                break
-            tag, pos = _read_varint(data, pos)
-            field_num = tag >> 3
-            wire_type = tag & 0x07
-
-            if wire_type == 2:  # LEN (embedded message)
-                length, pos = _read_varint(data, pos)
-                if field_num == 1:  # MediaEntry
-                    entry_data = data[pos : pos + length]
-                    entry_fields = _parse_protobuf_fields(entry_data)
-
-                    # Get name (field 1) and legacy_zip_filename (field 5)
-                    name = _get_str(entry_fields, 1, "")
-                    legacy_idx = _get_int(entry_fields, 5, -1)
-
-                    if name and legacy_idx >= 0:
-                        result[str(legacy_idx)] = name
-
-                pos += length
-            elif wire_type == 0:  # VARINT
-                _, pos = _read_varint(data, pos)
-            elif wire_type == 5:  # I32
-                pos += 4
-            elif wire_type == 1:  # I64
-                pos += 8
-            else:
-                break
-
-        return result
-
-    def import_apkg(
-        self,
-        apkg_path: str | Path,
-        import_media: bool = True,
-        merge_notetypes: bool = True,
-    ) -> dict:
-        """
-        Import notes and cards from an .apkg file into this collection.
-
-        This merges the content from the .apkg into the existing collection,
-        useful for adding decks to an existing collection before uploading.
-
-        Args:
-            apkg_path: Path to the .apkg file to import
-            import_media: Whether to import media files
-            merge_notetypes: Whether to merge notetypes or skip duplicates
-
-        Returns:
-            Dict with 'notes', 'cards', 'media' counts
-
-        Example:
-            col = SyncableCollection("/path/to/collection.anki2")
-            stats = col.import_apkg("/path/to/deck.apkg")
-            print(f"Imported {stats['notes']} notes")
-        """
-        import zipfile
-        import tempfile
-
-        apkg_path = Path(apkg_path)
-        stats = {"notes": 0, "cards": 0, "media": 0, "notetypes": 0, "decks": 0}
-
-        with zipfile.ZipFile(apkg_path, "r") as zf:
-            files = zf.namelist()
-
-            # Extract collection to temp file
-            with tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as f:
-                temp_col_path = Path(f.name)
-
-            try:
-                # Determine format and extract
-                if "collection.anki21b" in files:
-                    import zstandard as zstd
-
-                    compressed = zf.read("collection.anki21b")
-                    decompressed = zstd.ZstdDecompressor().decompress(compressed)
-                    temp_col_path.write_bytes(decompressed)
-                elif "collection.anki21" in files:
-                    temp_col_path.write_bytes(zf.read("collection.anki21"))
-                elif "collection.anki2" in files:
-                    temp_col_path.write_bytes(zf.read("collection.anki2"))
-                else:
-                    raise ValueError("No collection file found in .apkg")
-
-                # Open source collection
-                src_db = _connect_db(temp_col_path)
-
-                try:
-                    # Import notetypes
-                    stats["notetypes"] = self._import_notetypes(src_db, merge_notetypes)
-
-                    # Import decks
-                    stats["decks"] = self._import_decks(src_db)
-
-                    # Import notes
-                    stats["notes"] = self._import_notes(src_db)
-
-                    # Import cards
-                    stats["cards"] = self._import_cards(src_db)
-
-                    self.db.commit()
-                finally:
-                    src_db.close()
-
-            finally:
-                temp_col_path.unlink(missing_ok=True)
-
-            # Import media files
-            if import_media and "media" in files and self.media_folder:
-                self.media_folder.mkdir(exist_ok=True)
-                media_data = zf.read("media")
-
-                if media_data:
-                    try:
-                        media_map = json.loads(media_data)
-                    except json.JSONDecodeError:
-                        media_map = self._parse_media_entries(media_data)
-
-                    for idx, fname in media_map.items():
-                        if idx in files:
-                            dest = self.media_folder / fname
-                            if not dest.exists():
-                                dest.write_bytes(zf.read(idx))
-                                stats["media"] += 1
-
-        # Update modification time
-        self.db.execute(
-            "UPDATE col SET mod = ? WHERE id = 1", (int(time.time() * 1000),)
-        )
-        self.db.commit()
-
-        return stats
-
-    def _import_notetypes(self, src_db: sqlite3.Connection, merge: bool) -> int:
-        """Import notetypes from source database."""
-        count = 0
-        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM notetypes")}
-
-        for row in src_db.execute(
-            "SELECT id, name, mtime_secs, usn, config FROM notetypes"
-        ):
-            ntid = row[0]
-            if ntid in existing_ids:
-                if not merge:
-                    continue
-                # Update existing
-                self.db.execute(
-                    "UPDATE notetypes SET name=?, mtime_secs=?, usn=-1, config=? WHERE id=?",
-                    (row[1], row[2], row[4], ntid),
-                )
-            else:
-                # Insert new
-                self.db.execute(
-                    "INSERT INTO notetypes (id, name, mtime_secs, usn, config) VALUES (?, ?, ?, -1, ?)",
-                    (ntid, row[1], row[2], row[4]),
-                )
-                count += 1
-
-            # Import fields
-            self.db.execute("DELETE FROM fields WHERE ntid = ?", (ntid,))
-            for frow in src_db.execute(
-                "SELECT ntid, ord, name, config FROM fields WHERE ntid = ?", (ntid,)
-            ):
-                self.db.execute(
-                    "INSERT INTO fields (ntid, ord, name, config) VALUES (?, ?, ?, ?)",
-                    frow,
-                )
-
-            # Import templates
-            self.db.execute("DELETE FROM templates WHERE ntid = ?", (ntid,))
-            for trow in src_db.execute(
-                "SELECT ntid, ord, name, mtime_secs, usn, config FROM templates WHERE ntid = ?",
-                (ntid,),
-            ):
-                self.db.execute(
-                    "INSERT INTO templates (ntid, ord, name, mtime_secs, usn, config) VALUES (?, ?, ?, ?, -1, ?)",
-                    (trow[0], trow[1], trow[2], trow[3], trow[5]),
-                )
-
-        return count
-
-    def _import_decks(self, src_db: sqlite3.Connection) -> int:
-        """Import decks from source database."""
-        count = 0
-        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM decks")}
-
-        for row in src_db.execute(
-            "SELECT id, name, mtime_secs, usn, common, kind FROM decks"
-        ):
-            did = row[0]
-            if did in existing_ids:
-                # Update existing
-                self.db.execute(
-                    "UPDATE decks SET name=?, mtime_secs=?, usn=-1, common=?, kind=? WHERE id=?",
-                    (row[1], row[2], row[4], row[5], did),
-                )
-            else:
-                # Insert new
-                self.db.execute(
-                    "INSERT INTO decks (id, name, mtime_secs, usn, common, kind) VALUES (?, ?, ?, -1, ?, ?)",
-                    (did, row[1], row[2], row[4], row[5]),
-                )
-                count += 1
-
-        return count
-
-    def _import_notes(self, src_db: sqlite3.Connection) -> int:
-        """Import notes from source database."""
-        count = 0
-        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM notes")}
-        existing_guids = {row[0] for row in self.db.execute("SELECT guid FROM notes")}
-
-        for row in src_db.execute(
-            "SELECT id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data FROM notes"
-        ):
-            nid, guid = row[0], row[1]
-
-            # Skip if already exists (by ID or GUID)
-            if nid in existing_ids or guid in existing_guids:
-                continue
-
-            # Insert with usn=-1 to mark as pending sync
-            self.db.execute(
-                """INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data)
-                   VALUES (?, ?, ?, ?, -1, ?, ?, ?, ?, ?, ?)""",
-                (
-                    nid,
-                    guid,
-                    row[2],
-                    row[3],
-                    row[5],
-                    row[6],
-                    row[7],
-                    row[8],
-                    row[9],
-                    row[10],
-                ),
-            )
-            count += 1
-
-        return count
-
-    def _import_cards(self, src_db: sqlite3.Connection) -> int:
-        """Import cards from source database."""
-        count = 0
-        existing_ids = {row[0] for row in self.db.execute("SELECT id FROM cards")}
-        existing_notes = {row[0] for row in self.db.execute("SELECT id FROM notes")}
-
-        for row in src_db.execute(
-            """SELECT id, nid, did, ord, mod, usn, type, queue, due, ivl,
-                      factor, reps, lapses, left, odue, odid, flags, data FROM cards"""
-        ):
-            cid, nid = row[0], row[1]
-
-            # Skip if already exists or note doesn't exist
-            if cid in existing_ids or nid not in existing_notes:
-                continue
-
-            # Insert with usn=-1 to mark as pending sync
-            self.db.execute(
-                """INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl,
-                                      factor, reps, lapses, left, odue, odid, flags, data)
-                   VALUES (?, ?, ?, ?, ?, -1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    cid,
-                    nid,
-                    row[2],
-                    row[3],
-                    row[4],
-                    row[6],
-                    row[7],
-                    row[8],
-                    row[9],
-                    row[10],
-                    row[11],
-                    row[12],
-                    row[13],
-                    row[14],
-                    row[15],
-                    row[16],
-                    row[17],
-                ),
-            )
-            count += 1
-
-        return count

@@ -3,18 +3,16 @@
 # License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 """
-Download collection from server and export to .apkg file.
+Download collection from server.
 
 Usage: uv run --env-file tests/.env python -m ankiclientsync.tests.test_download
 """
 
-import json
 import sqlite3
 import tempfile
-import zipfile
 from pathlib import Path
 
-from .. import MediaSyncClient, SyncClient, SyncableCollection
+from .. import SyncClient, SyncableCollection
 from .conftest import (
     ENDPOINT,
     TestRunner,
@@ -24,7 +22,7 @@ from .conftest import (
 
 
 def main():
-    print(f"{'=' * 60}\nANKI SYNC CLIENT - DOWNLOAD & EXPORT TESTS\n{'=' * 60}")
+    print(f"{'=' * 60}\nANKI SYNC CLIENT - DOWNLOAD TESTS\n{'=' * 60}")
     print(f"Endpoint: {ENDPOINT}")
 
     if not check_dependencies():
@@ -39,9 +37,6 @@ def main():
 
     runner = TestRunner()
     runner.run("Download collection", lambda: test_download_collection(auth))
-    runner.run("Export to .apkg (basic)", lambda: test_export_basic(auth))
-    runner.run("Export to .apkg (with media)", lambda: test_export_with_media(auth))
-    runner.run("Verify .apkg structure", lambda: test_verify_apkg_structure(auth))
 
     return runner.summary()
 
@@ -62,142 +57,6 @@ def test_download_collection(auth):
 
         if notes == 0:
             print("  WARNING: No notes downloaded (server may be empty)")
-
-        return True
-    finally:
-        col.close()
-        client.close()
-
-
-def test_export_basic(auth):
-    """Test basic export to .apkg without media."""
-    col_path = Path(tempfile.gettempdir()) / "test_collection.anki2"
-    _create_empty_collection(col_path)
-
-    col = SyncableCollection(col_path)
-    client = SyncClient(col, auth)
-
-    try:
-        client.full_download()
-        notes_before = col.count("notes")
-
-        # Export without media
-        apkg_path = Path(tempfile.gettempdir()) / "test_export.apkg"
-        exported_notes = col.export_anki_package(apkg_path, with_media=False)
-
-        print(f"  Exported: {exported_notes} notes to {apkg_path}")
-        print(f"  File size: {apkg_path.stat().st_size} bytes")
-
-        if exported_notes != notes_before:
-            print(f"  ERROR: Expected {notes_before} notes, got {exported_notes}")
-            return False
-
-        if not apkg_path.exists():
-            print("  ERROR: Export file not created")
-            return False
-
-        return True
-    finally:
-        col.close()
-        client.close()
-
-
-def test_export_with_media(auth):
-    """Test export to .apkg with media files."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        col_path = tmpdir / "collection.anki2"
-        media_folder = tmpdir / "collection.media"
-        media_folder.mkdir()
-
-        _create_empty_collection(col_path)
-
-        col = SyncableCollection(col_path, media_folder=media_folder)
-        client = SyncClient(col, auth)
-
-        try:
-            # Download collection
-            client.full_download()
-            notes = col.count("notes")
-            print(f"  Downloaded: {notes} notes")
-
-            # Download media
-            media_client = MediaSyncClient(media_folder, auth)
-            try:
-                stats = media_client.sync()
-                print(f"  Downloaded: {stats['downloaded']} media files")
-            finally:
-                media_client.close()
-
-            # Export with media
-            apkg_path = tmpdir / "export_with_media.apkg"
-            exported_notes = col.export_anki_package(apkg_path, with_media=True)
-
-            print(f"  Exported: {exported_notes} notes")
-            print(f"  File size: {apkg_path.stat().st_size} bytes")
-
-            # Verify media is in the package
-            with zipfile.ZipFile(apkg_path, "r") as zf:
-                files = zf.namelist()
-                # Count media files (numeric names)
-                media_count = sum(1 for f in files if f.isdigit())
-                print(f"  Media files in package: {media_count}")
-
-            return True
-        finally:
-            col.close()
-            client.close()
-
-
-def test_verify_apkg_structure(auth):
-    """Verify the .apkg file structure is correct."""
-    col_path = Path(tempfile.gettempdir()) / "test_collection.anki2"
-    _create_empty_collection(col_path)
-
-    col = SyncableCollection(col_path)
-    client = SyncClient(col, auth)
-
-    try:
-        client.full_download()
-
-        # Export
-        apkg_path = Path(tempfile.gettempdir()) / "test_structure.apkg"
-        col.export_anki_package(apkg_path)
-
-        # Verify structure
-        with zipfile.ZipFile(apkg_path, "r") as zf:
-            files = zf.namelist()
-            print(f"  Files in package: {files}")
-
-            # Required files
-            required = ["meta", "collection.anki21b", "collection.anki2", "media"]
-            for req in required:
-                if req not in files:
-                    print(f"  ERROR: Missing required file: {req}")
-                    return False
-
-            # Verify meta file (protobuf with version)
-            meta_data = zf.read("meta")
-            if len(meta_data) < 2:
-                print("  ERROR: meta file too small")
-                return False
-            print(f"  meta file: {len(meta_data)} bytes")
-
-            # Verify collection.anki21b is zstd compressed
-            col_data = zf.read("collection.anki21b")
-            # zstd magic number: 0x28 0xB5 0x2F 0xFD
-            if col_data[:4] == b"\x28\xb5\x2f\xfd":
-                print("  collection.anki21b: zstd compressed")
-            else:
-                print("  WARNING: collection.anki21b may not be zstd compressed")
-
-            # Verify collection.anki2 (legacy dummy)
-            legacy_data = zf.read("collection.anki2")
-            print(f"  collection.anki2 (legacy): {len(legacy_data)} bytes")
-
-            # Verify media file exists
-            media_data = zf.read("media")
-            print(f"  media: {len(media_data)} bytes")
 
         return True
     finally:
